@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "music-deduplication"
+version = "0.1.0"
+description = "桌面端音乐去重工具，支持按元信息、码率、封面等规则保留最佳文件。"
+readme = "README.md"
+requires-python = ">=3.12"
+
+[tool.setuptools.packages.find]
+where = ["src"]
