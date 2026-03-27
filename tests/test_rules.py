@@ -30,6 +30,10 @@ class RuleTests(unittest.TestCase):
             size_bytes=1024,
             title="Blue Train",
             artist="John Coltrane",
+            year=1958,
+            genre="Jazz",
+            track_number=1,
+            format_info="MP3 320 kbps",
         )
         self.assertTrue(build_dedupe_key(track).startswith("pair::"))
 
@@ -43,6 +47,10 @@ class RuleTests(unittest.TestCase):
             title="Song",
             artist="Singer",
             album="Album",
+            year=2023,
+            genre="Pop",
+            track_number=1,
+            format_info="MP3 128 kbps",
             bitrate_kbps=128,
             has_cover=False,
         )
@@ -54,6 +62,10 @@ class RuleTests(unittest.TestCase):
             title="Song",
             artist="Singer",
             album="Album",
+            year=2023,
+            genre="Pop",
+            track_number=1,
+            format_info="MP3 320 kbps",
             bitrate_kbps=320,
             has_cover=True,
         )
@@ -86,6 +98,10 @@ class RuleTests(unittest.TestCase):
             title="菊花台",
             artist="周杰伦",
             album="依然范特西",
+            year=2006,
+            genre="Pop",
+            track_number=7,
+            format_info="MP3 320 kbps",
             bitrate_kbps=320,
             has_cover=True,
         )
@@ -95,6 +111,7 @@ class RuleTests(unittest.TestCase):
             extension=".mp3",
             size_bytes=1_000_000,
             bitrate_kbps=128,
+            format_info="MP3 128 kbps",
         )
         groups = find_duplicate_groups([metadata_track, filename_track], rules)
         self.assertEqual(len(groups), 1)
