@@ -19,7 +19,7 @@
   --duplicate-text: #92400e;
   --shadow: 0 1px 2px rgba(17, 24, 39, 0.04);
   --radius: 14px;
-  --sidebar-width: 280px;
+  --sidebar-width: 320px;
   --font: "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
 }
 
@@ -527,9 +527,13 @@ textarea {
 .modal {
   position: fixed;
   inset: 0;
-  display: grid;
+  display: none;
   place-items: center;
   z-index: 30;
+}
+
+.modal.visible {
+  display: grid;
 }
 
 .modal-backdrop {

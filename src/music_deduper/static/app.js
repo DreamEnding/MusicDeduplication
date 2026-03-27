@@ -588,11 +588,11 @@ function openExecuteModal() {
   );
   const backupDir = elements.backupDirInput.value.trim() || "默认备份目录";
   elements.modalBody.textContent = `将处理 ${state.groups.length} 个重复分组（共 ${duplicateCount} 个重复文件），移动到 ${backupDir}。此操作不可撤销。`;
-  elements.executeModal.hidden = false;
+  elements.executeModal.classList.add("visible");
 }
 
 function closeExecuteModal() {
-  elements.executeModal.hidden = true;
+  elements.executeModal.classList.remove("visible");
 }
 
 async function executeDedupe() {
