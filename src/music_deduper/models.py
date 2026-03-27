@@ -17,6 +17,10 @@ class AudioTrack:
     duration_seconds: float | None = None
     has_cover: bool = False
     metadata_source: str = ""
+    year: int | None = None
+    genre: str = ""
+    track_number: int | None = None
+    format_info: str = ""
     warnings: list[str] = field(default_factory=list)
 
     @property
