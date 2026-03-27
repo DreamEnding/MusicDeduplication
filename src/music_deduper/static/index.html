@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Music Deduplication</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="panel">
+          <h1 class="sidebar-title">Music Deduplication</h1>
+          <p class="sidebar-subtitle">本地扫描、本地分析、本地清理。</p>
+        </div>
+
+        <section class="panel">
+          <h2 class="panel-title">扫描目录</h2>
+          <label class="field-label" for="rootSelect">盘符 / 目录</label>
+          <div class="row">
+            <select id="rootSelect" class="input"></select>
+            <button id="chooseFolderButton" class="button button-secondary" type="button">文件夹</button>
+          </div>
+          <input id="folderInput" type="file" webkitdirectory directory hidden>
+        </section>
+
+        <section class="panel">
+          <h2 class="panel-title">保留规则</h2>
+          <div id="ruleList" class="rule-list"></div>
+        </section>
+
+        <section class="panel">
+          <h2 class="panel-title">执行设置</h2>
+          <label class="toggle">
+            <input id="previewToggle" type="checkbox">
+            <span>仅预览，不移动重复文件</span>
+          </label>
+          <label class="field-label" for="backupDirInput">备份目录</label>
+          <input id="backupDirInput" class="input" type="text" placeholder="D:\MusicDeduplicationBackups">
+        </section>
+
+        <section class="panel actions">
+          <button id="scanButton" class="button button-primary" type="button">开始扫描</button>
+          <button id="stopButton" class="button button-secondary" type="button">停止扫描</button>
+          <div class="progress-wrap">
+            <div class="progress-meta">
+              <span id="progressText">等待扫描</span>
+              <span id="progressCount">0</span>
+            </div>
+            <div class="progress-bar">
+              <div id="progressFill" class="progress-fill"></div>
+            </div>
+          </div>
+        </section>
+      </aside>
+
+      <main class="content">
+        <header class="content-header">
+          <div>
+            <h2 class="content-title">重复结果</h2>
+            <p id="scanSummary" class="content-subtitle">尚未开始扫描。</p>
+          </div>
+          <button id="executeButton" class="button button-primary" type="button">执行去重</button>
+        </header>
+
+        <section class="stats-grid">
+          <article class="stat-card">
+            <span class="stat-label">总音频数</span>
+            <strong id="totalAudioStat" class="stat-value">0</strong>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">重复分组</span>
+            <strong id="duplicateGroupsStat" class="stat-value">0</strong>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">待清理文件</span>
+            <strong id="filesToCleanStat" class="stat-value">0</strong>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">预计释放空间</span>
+            <strong id="reclaimableStat" class="stat-value">0 B</strong>
+          </article>
+        </section>
+
+        <section class="toolbar panel">
+          <div class="toolbar-group">
+            <input id="searchInput" class="input" type="search" placeholder="搜索歌名或歌手">
+            <select id="artistFilter" class="input">
+              <option value="">全部歌手</option>
+            </select>
+          </div>
+          <div class="toolbar-group">
+            <button id="resortButton" class="button button-secondary" type="button">重新排序</button>
+            <button id="exportButton" class="button button-secondary" type="button">导出报告</button>
+          </div>
+        </section>
+
+        <section class="results panel">
+          <div id="resultsEmpty" class="empty-state">扫描完成后将在这里显示重复分组。</div>
+          <div id="resultsList" class="group-list"></div>
+        </section>
+
+        <section class="panel log-panel">
+          <button id="logToggle" class="log-toggle" type="button" aria-expanded="false">扫描日志</button>
+          <div id="logContent" class="log-content" hidden>
+            <pre id="scanLog" class="log-output"></pre>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <!-- Execute confirmation modal -->
+    <div id="executeModal" class="modal" hidden>
+      <div class="modal-backdrop"></div>
+      <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+        <h2 id="modalTitle" class="modal-title">确认执行去重</h2>
+        <p id="modalBody" class="modal-body">确认将重复文件移动到备份目录。</p>
+        <div class="modal-actions">
+          <button id="cancelExecuteButton" class="button button-secondary" type="button">取消</button>
+          <button id="confirmExecuteButton" class="button button-primary" type="button">确认执行</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Template: duplicate group card -->
+    <template id="groupTemplate">
+      <article class="group-card">
+        <button class="group-summary" type="button">
+          <div>
+            <h3 class="group-title"></h3>
+            <p class="group-meta"></p>
+          </div>
+          <span class="group-reclaim"></span>
+        </button>
+        <div class="group-details" hidden></div>
+      </article>
+    </template>
+
+    <!-- Template: side-by-side track comparison -->
+    <template id="trackComparisonTemplate">
+      <div class="comparison-grid">
+        <section class="track-card track-card-keep">
+          <header class="track-card-header">保留</header>
+          <dl class="track-details"></dl>
+          <button class="switch-keep button button-secondary" type="button">设为保留</button>
+        </section>
+        <section class="track-card track-card-duplicate">
+          <header class="track-card-header">重复</header>
+          <dl class="track-details"></dl>
+          <button class="switch-keep button button-secondary" type="button">设为保留</button>
+        </section>
+      </div>
+    </template>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>
