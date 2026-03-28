@@ -35,8 +35,12 @@ const $ = (selector) => document.querySelector(selector);
 
 const elements = {
   rootSelect: $("#rootSelect"),
-  chooseFolderButton: $("#chooseFolderButton"),
-  folderInput: $("#folderInput"),
+  pathInput: $("#pathInput"),
+  browseButton: $("#browseButton"),
+  browsePanel: $("#browsePanel"),
+  browseUpButton: $("#browseUpButton"),
+  browseCurrentPath: $("#browseCurrentPath"),
+  browseList: $("#browseList"),
   ruleList: $("#ruleList"),
   previewToggle: $("#previewToggle"),
   backupDirInput: $("#backupDirInput"),
@@ -67,6 +71,25 @@ const elements = {
   groupTemplate: $("#groupTemplate"),
   trackComparisonTemplate: $("#trackComparisonTemplate"),
 };
+
+// ---- Animation helpers ----
+
+function animateValue(el, start, end, duration) {
+  if (start === end) return;
+  const range = end - start;
+  const startTime = performance.now();
+
+  function step(timestamp) {
+    const progress = Math.min((timestamp - startTime) / duration, 1);
+    const eased = 1 - Math.pow(1 - progress, 3); // ease-out cubic
+    el.textContent = Math.round(start + range * eased);
+    if (progress < 1) {
+      requestAnimationFrame(step);
+    }
+  }
+
+  requestAnimationFrame(step);
+}
 
 // ---- API helper ----
 
@@ -102,10 +125,12 @@ function init() {
 }
 
 function bindEvents() {
-  elements.chooseFolderButton.addEventListener("click", () =>
-    elements.folderInput.click()
-  );
-  elements.folderInput.addEventListener("change", onChooseFolder);
+  elements.rootSelect.addEventListener("change", onRootChanged);
+  elements.browseButton.addEventListener("click", toggleBrowsePanel);
+  elements.browseUpButton.addEventListener("click", browseUp);
+  elements.pathInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") elements.pathInput.blur();
+  });
   elements.previewToggle.addEventListener("change", () => {
     state.previewOnly = elements.previewToggle.checked;
   });
@@ -134,7 +159,6 @@ function bindEvents() {
 
 async function loadRoots() {
   try {
-    // Actual server returns a plain list of strings
     const roots = await api("/api/roots");
     const rootList = Array.isArray(roots) ? roots : [];
 
@@ -149,34 +173,65 @@ async function loadRoots() {
     if (rootList.length > 0) {
       state.selectedRoot = rootList[0];
       elements.rootSelect.value = state.selectedRoot;
+      elements.pathInput.value = state.selectedRoot;
     }
   } catch (err) {
     appendLog("加载盘符失败: " + err.message);
   }
-
-  elements.rootSelect.addEventListener("change", () => {
-    state.selectedRoot = elements.rootSelect.value;
-    state.selectedFolderPath = "";
-  });
 }
 
-// ---- Folder chooser (webkitdirectory) ----
+function onRootChanged() {
+  state.selectedRoot = elements.rootSelect.value;
+  elements.pathInput.value = state.selectedRoot;
+  elements.browsePanel.hidden = true;
+}
 
-function onChooseFolder(event) {
-  const files = Array.from(event.target.files || []);
-  if (files.length === 0) return;
+// ---- Directory browsing ----
 
-  const first = files[0];
-  const relative = first.webkitRelativePath || first.name;
-  const topLevel = relative.split("/")[0];
-  state.selectedFolderPath = topLevel;
+async function toggleBrowsePanel() {
+  if (!elements.browsePanel.hidden) {
+    elements.browsePanel.hidden = true;
+    return;
+  }
+  elements.browsePanel.hidden = false;
+  const currentPath = elements.pathInput.value.trim() || state.selectedRoot;
+  await loadBrowsePath(currentPath);
+}
 
-  elements.rootSelect.innerHTML = "";
-  const option = document.createElement("option");
-  option.value = topLevel;
-  option.textContent = topLevel;
-  elements.rootSelect.appendChild(option);
-  elements.rootSelect.value = topLevel;
+async function loadBrowsePath(dirPath) {
+  try {
+    const result = await api(`/api/browse?path=${encodeURIComponent(dirPath)}`);
+    elements.browseCurrentPath.textContent = result.path || dirPath;
+
+    while (elements.browseList.firstChild) {
+      elements.browseList.removeChild(elements.browseList.firstChild);
+    }
+
+    result.children.forEach((child) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "browse-item";
+      item.textContent = child;
+      const fullPath = result.path ? `${result.path}\\${child}` : child;
+      item.addEventListener("click", () => {
+        elements.pathInput.value = fullPath;
+        loadBrowsePath(fullPath);
+      });
+      elements.browseList.appendChild(item);
+    });
+
+    elements.browseUpButton.dataset.parent = result.parent || "";
+  } catch (err) {
+    appendLog("浏览目录失败: " + err.message);
+  }
+}
+
+async function browseUp() {
+  const parent = elements.browseUpButton.dataset.parent;
+  if (parent) {
+    await loadBrowsePath(parent);
+    elements.pathInput.value = parent;
+  }
 }
 
 // ---- Rule rendering ----
@@ -264,9 +319,9 @@ function onRuleAction(event) {
 // ---- Scan lifecycle ----
 
 async function startScan() {
-  const selectedPath = elements.rootSelect.value.trim();
+  const selectedPath = elements.pathInput.value.trim();
   if (!selectedPath) {
-    alert("请选择扫描目录");
+    alert("请输入或选择扫描目录");
     return;
   }
 
@@ -367,6 +422,8 @@ async function loadGroups() {
     const qs = params.toString();
     const payload = await api(`/api/groups${qs ? "?" + qs : ""}`);
 
+    const prevStats = { ...state.stats };
+
     state.groups = payload.groups || [];
     // Actual server stats field names
     state.stats = {
@@ -379,7 +436,7 @@ async function loadGroups() {
     // Collect unique artists from all groups for the filter dropdown
     collectArtors();
 
-    renderStats();
+    renderStats(prevStats);
     renderArtistFilter();
     renderGroups();
   } catch (err) {
@@ -398,10 +455,13 @@ function collectArtors() {
   state.allArtists = Array.from(artistSet).sort();
 }
 
-function renderStats() {
-  elements.totalAudioStat.textContent = String(state.stats.total_tracks);
-  elements.duplicateGroupsStat.textContent = String(state.stats.total_groups);
-  elements.filesToCleanStat.textContent = String(state.stats.total_duplicates);
+function renderStats(prevStats) {
+  const prev = prevStats || state.stats;
+
+  // Animate numeric stats
+  animateValue(elements.totalAudioStat, prev.total_tracks || 0, state.stats.total_tracks, 400);
+  animateValue(elements.duplicateGroupsStat, prev.total_groups || 0, state.stats.total_groups, 400);
+  animateValue(elements.filesToCleanStat, prev.total_duplicates || 0, state.stats.total_duplicates, 400);
   elements.reclaimableStat.textContent = state.stats.total_reclaimable_display;
 }
 
@@ -421,7 +481,7 @@ function renderGroups() {
   elements.resultsList.innerHTML = "";
   elements.resultsEmpty.hidden = state.groups.length > 0;
 
-  state.groups.forEach((group) => {
+  state.groups.forEach((group, index) => {
     const template = elements.groupTemplate.content;
     const fragment = template.cloneNode(true);
 
@@ -438,14 +498,18 @@ function renderGroups() {
     // Actual server uses reclaimable_display
     reclaim.textContent = group.reclaimable_display || "0 B";
 
+    // Staggered card animation
+    card.style.animationDelay = `${index * 60}ms`;
+
     summaryButton.addEventListener("click", () => {
-      const isHidden = details.hasAttribute("hidden");
-      if (isHidden) {
-        details.removeAttribute("hidden");
+      const isExpanded = details.classList.contains("expanded");
+      if (!isExpanded) {
         renderGroupDetails(group, details);
+        // Force reflow before adding class for transition
+        void details.offsetHeight;
+        details.classList.add("expanded");
       } else {
-        details.setAttribute("hidden", "");
-        details.innerHTML = "";
+        details.classList.remove("expanded");
       }
     });
 
@@ -627,7 +691,11 @@ function toggleLogPanel() {
   const expanded =
     elements.logToggle.getAttribute("aria-expanded") === "true";
   elements.logToggle.setAttribute("aria-expanded", String(!expanded));
-  elements.logContent.hidden = expanded;
+  if (expanded) {
+    elements.logContent.classList.remove("open");
+  } else {
+    elements.logContent.classList.add("open");
+  }
 }
 
 function appendLog(message) {
@@ -639,8 +707,8 @@ function appendLog(message) {
   elements.scanLog.scrollTop = elements.scanLog.scrollHeight;
 
   // Auto-open log panel if hidden
-  if (elements.logContent.hidden) {
-    elements.logContent.hidden = false;
+  if (!elements.logContent.classList.contains("open")) {
+    elements.logContent.classList.add("open");
     elements.logToggle.setAttribute("aria-expanded", "true");
   }
 }

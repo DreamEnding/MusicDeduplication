@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Music Deduplication</title>
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=2">
   </head>
   <body>
     <div class="app-shell">
@@ -16,12 +16,20 @@
 
         <section class="panel">
           <h2 class="panel-title">扫描目录</h2>
-          <label class="field-label" for="rootSelect">盘符 / 目录</label>
+          <label class="field-label" for="rootSelect">盘符</label>
+          <select id="rootSelect" class="input"></select>
+          <label class="field-label" for="pathInput">目录路径</label>
           <div class="row">
-            <select id="rootSelect" class="input"></select>
-            <button id="chooseFolderButton" class="button button-secondary" type="button">文件夹</button>
+            <input id="pathInput" class="input" type="text" placeholder="选择盘符后自动填充，或手动输入路径">
+            <button id="browseButton" class="button button-secondary" type="button">浏览</button>
           </div>
-          <input id="folderInput" type="file" webkitdirectory directory hidden>
+          <div id="browsePanel" class="browse-panel" hidden>
+            <div class="browse-header">
+              <button id="browseUpButton" class="button button-secondary" type="button">..</button>
+              <span id="browseCurrentPath" class="browse-path"></span>
+            </div>
+            <div id="browseList" class="browse-list"></div>
+          </div>
         </section>
 
         <section class="panel">
@@ -102,7 +110,7 @@
 
         <section class="panel log-panel">
           <button id="logToggle" class="log-toggle" type="button" aria-expanded="false">扫描日志</button>
-          <div id="logContent" class="log-content" hidden>
+          <div id="logContent" class="log-content">
             <pre id="scanLog" class="log-output"></pre>
           </div>
         </section>
@@ -132,7 +140,7 @@
           </div>
           <span class="group-reclaim"></span>
         </button>
-        <div class="group-details" hidden></div>
+        <div class="group-details"></div>
       </article>
     </template>
 
@@ -152,6 +160,15 @@
       </div>
     </template>
 
-    <script src="/static/app.js" defer></script>
+    <script src="/static/app.js?v=2" defer></script>
+    <script>
+      window.addEventListener('error', function(e) {
+        console.error('JS Error:', e.message, e.filename, e.lineno);
+        var d = document.createElement('div');
+        d.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#ef4444;color:#fff;padding:8px 16px;z-index:9999;font-size:13px';
+        d.textContent = 'JS Error: ' + e.message + ' (' + e.filename + ':' + e.lineno + ')';
+        document.body.appendChild(d);
+      });
+    </script>
   </body>
 </html>

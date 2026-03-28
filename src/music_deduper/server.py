@@ -171,6 +171,26 @@ def create_app() -> FastAPI:
     def get_roots() -> list[str]:
         return list_available_roots()
 
+    # ---- GET /api/browse ----
+
+    @app.get("/api/browse")
+    def browse_directory(path: str = "") -> dict:
+        """List subdirectories of the given path for directory browsing."""
+        if not path:
+            return {"path": "", "parent": "", "children": list_available_roots()}
+        try:
+            target = Path(path)
+            if not target.exists() or not target.is_dir():
+                return {"path": path, "parent": "", "children": []}
+            children = sorted(
+                child.name for child in target.iterdir()
+                if child.is_dir() and not child.name.startswith(".")
+            )
+            parent = str(target.parent) if target.parent != target else ""
+            return {"path": str(target), "parent": parent, "children": children}
+        except (PermissionError, OSError):
+            return {"path": path, "parent": "", "children": []}
+
     # ---- POST /api/scan ----
 
     @app.post("/api/scan")

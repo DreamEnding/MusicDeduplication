@@ -20,7 +20,7 @@ from music_deduper.models import AudioTrack
 
 class RuleTests(unittest.TestCase):
     def test_normalize_text(self) -> None:
-        self.assertEqual(normalize_text("Hello - World (Live)"), "hello world")
+        self.assertEqual(normalize_text("Hello - World (Live)"), "hello world live")
 
     def test_build_key_prefers_title_artist(self) -> None:
         track = AudioTrack(

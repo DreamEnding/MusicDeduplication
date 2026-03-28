@@ -39,8 +39,6 @@ RULE_DEFINITIONS = [
 
 RULE_MAP = {rule.key: rule for rule in RULE_DEFINITIONS}
 _PAIR_PREFIX = "pair::"
-_TITLE_PREFIX = "title::"
-_FILE_PREFIX = "file::"
 
 
 def default_rule_states() -> list[RuleState]:
@@ -105,89 +103,166 @@ def find_duplicate_groups(tracks: list[AudioTrack], rule_states: list[RuleState]
 
 def build_dedupe_key(track: AudioTrack) -> str:
     signatures = build_dedupe_signatures(track)
-    ordered = sorted(signatures, key=_signature_priority)
+    ordered = sorted(signatures, key=len, reverse=True)
     return ordered[0] if ordered else ""
+
+
+# ---- Version tag extraction ----
+
+# Common version/variant suffixes in Chinese and English
+_VERSION_PATTERNS = re.compile(
+    r"""(?ix)
+    \s*[-—－]?\s*                          # optional separator
+    (?:                                    # version tag group:
+        \( (?:                             # parenthesized form
+            TV\s*(?:size|ver|version)?      # TV size / TV ver
+          | 纯音[乐]?版?                     # 纯音/纯音乐/纯音版
+          | 伴奏
+          | instrumental
+          | acapella
+          | live
+          | demo
+          | remix
+          | cover
+          | karaoke
+          | off\s*vocal
+          | bgm
+          | \S*版                          # any Chinese version tag ending in 版
+          | \S*version                      # English version
+          | \S*ver\.?                       # ver / ver.
+          | \S*edit                         # edit / radio edit
+          | \S*mix                          # mix / remix
+          | remaster(?:ed)?
+        ) \)
+      | \[ (?:                             # bracketed form
+            TV\s*(?:size|ver|version)?
+          | 纯音[乐]?版?
+          | 伴奏
+          | instrumental
+          | acapella
+          | live
+          | demo
+          | remix
+          | cover
+          | karaoke
+          | off\s*vocal
+          | bgm
+          | \S*版
+          | \S*version
+          | \S*ver\.?
+          | \S*edit
+          | \S*mix
+          | remaster(?:ed)?
+        ) \]
+      | (?:                                 # bare form (no brackets)
+            TV\s*(?:size|ver|version)?
+          | 纯音[乐]?版?
+          | 伴奏
+          | instrumental
+          | acapella
+          | live
+          | demo
+          | remix
+          | cover
+          | karaoke
+          | off\s*vocal
+          | bgm
+          | remaster(?:ed)?
+        ) \s*$
+    )
+    """
+)
+
+
+def _extract_version_and_base(raw: str) -> tuple[str, str]:
+    """Split raw text into (base_title, version_tag).
+
+    Returns (base, version) where version is "" if no version tag found.
+    """
+    match = _VERSION_PATTERNS.search(raw)
+    if not match:
+        return raw.strip(), ""
+    version = match.group(0).strip(" ()[]")
+    base = raw[: match.start()].strip()
+    return base, version.lower()
 
 
 def build_dedupe_signatures(track: AudioTrack) -> set[str]:
     signatures: set[str] = set()
-    title = normalize_text(track.title)
-    artist = normalize_text(track.artist)
-    stem = normalize_text(track.filename_stem)
 
-    if title and artist:
-        signatures.add(f"{_PAIR_PREFIX}{canonical_pair_key(title, artist)}")
-        signatures.add(f"{_TITLE_PREFIX}{title}")
+    # --- From metadata: title + artist ---
+    raw_title = track.title or ""
+    raw_artist = track.artist or ""
 
-    if title and not artist:
-        signatures.add(f"{_TITLE_PREFIX}{title}")
+    if raw_title and raw_artist:
+        base_title, version = _extract_version_and_base(raw_title)
+        norm_title = normalize_text(base_title)
+        norm_artist = normalize_text(raw_artist)
+        if norm_title and norm_artist:
+            # Signature includes version so "TV版" won't match "纯音版"
+            norm_version = normalize_text(version) if version else ""
+            sig = f"{_PAIR_PREFIX}{norm_artist}::{norm_title}"
+            if norm_version:
+                sig += f"::{norm_version}"
+            signatures.add(sig)
 
-    inferred_pair = infer_pair_from_filename(track.filename_stem)
-    if inferred_pair:
-        left, right = inferred_pair
-        signatures.add(f"{_PAIR_PREFIX}{canonical_pair_key(left, right)}")
-
-    if stem:
-        signatures.add(f"{_FILE_PREFIX}{stem}")
+    # --- From filename: try "Artist - Title" pattern ---
+    inferred = infer_pair_from_filename(track.filename_stem)
+    if inferred:
+        artist_part, title_part, version_part = inferred
+        norm_artist = normalize_text(artist_part)
+        norm_title = normalize_text(title_part)
+        norm_version = normalize_text(version_part) if version_part else ""
+        if norm_artist and norm_title and norm_artist != norm_title:
+            # Canonical sort since we don't know which is artist vs title
+            ordered = sorted([norm_artist, norm_title])
+            sig = f"{_PAIR_PREFIX}{ordered[0]}::{ordered[1]}"
+            if norm_version:
+                sig += f"::{norm_version}"
+            signatures.add(sig)
 
     return signatures
 
 
-def infer_pair_from_filename(filename_stem: str) -> tuple[str, str] | None:
+def infer_pair_from_filename(filename_stem: str) -> tuple[str, str, str] | None:
+    """Parse 'Artist - Title' from filename, extracting version tag.
+
+    Returns (artist, title, version) or None.
+    """
     raw = re.sub(r"\s+", " ", filename_stem).strip()
     if not raw:
         return None
-    parts = [part.strip() for part in re.split(r"\s*[-—－_]+\s*", raw) if part.strip()]
+    parts = [part.strip() for part in re.split(r"\s*[-—－]+\s*", raw) if part.strip()]
     if len(parts) != 2:
         return None
-    left = normalize_text(parts[0])
-    right = normalize_text(parts[1])
-    if not left or not right:
+    artist_raw = parts[0]
+    title_raw = parts[1]
+    if len(artist_raw) < 2 or len(title_raw) < 2:
         return None
-    if left == right:
-        return None
-    if len(left) < 2 or len(right) < 2:
-        return None
-    return left, right
 
-
-def canonical_pair_key(left: str, right: str) -> str:
-    ordered = sorted([left, right])
-    return "::".join(ordered)
+    base_title, version = _extract_version_and_base(title_raw)
+    norm_artist = normalize_text(artist_raw)
+    norm_title = normalize_text(base_title)
+    if not norm_artist or not norm_title:
+        return None
+    if norm_artist == norm_title:
+        return None
+    return artist_raw, base_title, version
 
 
 def describe_group_key(tracks: list[AudioTrack]) -> str:
-    signatures = [build_dedupe_signatures(track) for track in tracks]
-    frequency: dict[str, int] = {}
-    for signature_set in signatures:
-        for signature in signature_set:
-            frequency[signature] = frequency.get(signature, 0) + 1
-
-    shared = [signature for signature, count in frequency.items() if count >= 2]
-    if not shared:
-        return tracks[0].display_title
-
-    best = min(shared, key=_signature_priority)
-    if best.startswith(_PAIR_PREFIX):
-        left, right = best[len(_PAIR_PREFIX) :].split("::", 1)
-        return f"{left} / {right}"
-    if best.startswith(_TITLE_PREFIX):
-        return best[len(_TITLE_PREFIX) :]
-    return best[len(_FILE_PREFIX) :]
-
-
-def _signature_priority(signature: str) -> tuple[int, int, str]:
-    if signature.startswith(_PAIR_PREFIX):
-        return (0, -len(signature), signature)
-    if signature.startswith(_TITLE_PREFIX):
-        return (1, -len(signature), signature)
-    return (2, -len(signature), signature)
+    first = tracks[0]
+    title = first.title or first.display_title
+    artist = first.artist or ""
+    if title and artist:
+        return f"{artist} - {title}"
+    return title or first.display_title
 
 
 def normalize_text(value: str) -> str:
     value = value.lower().strip()
-    value = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", value)
-    value = re.sub(r"\b(feat|ft|ver|version|live|demo|remaster)\b\.?", " ", value)
+    # Strip bracket/paren content that is NOT version-related (feat/ft etc.)
+    value = re.sub(r"\b(feat|ft)\.?\s*", " ", value)
     value = re.sub(r"[_\-]+", " ", value)
     value = re.sub(r"[^\w\s\u4e00-\u9fff]", " ", value)
     value = re.sub(r"\s+", " ", value)
