@@ -20,6 +20,8 @@ const state = {
   selectedFolderPath: "",
   previewOnly: false,
   backupDir: "",
+  executeTaskId: null,
+  algorithm: "builtin",
   rules: [
     { key: "metadata_complete", label: "信息更完整优先", enabled: true },
     { key: "higher_bitrate", label: "码率更高优先", enabled: true },
@@ -68,6 +70,14 @@ const elements = {
   modalBody: $("#modalBody"),
   cancelExecuteButton: $("#cancelExecuteButton"),
   confirmExecuteButton: $("#confirmExecuteButton"),
+  executeProgress: $("#executeProgress"),
+  executeProgressText: $("#executeProgressText"),
+  executeProgressFill: $("#executeProgressFill"),
+  stopExecuteButton: $("#stopExecuteButton"),
+  aiConfigPanel: $("#aiConfigPanel"),
+  aiUrlInput: $("#aiUrlInput"),
+  aiKeyInput: $("#aiKeyInput"),
+  aiModelInput: $("#aiModelInput"),
   groupTemplate: $("#groupTemplate"),
   trackComparisonTemplate: $("#trackComparisonTemplate"),
 };
@@ -146,7 +156,16 @@ function bindEvents() {
   elements.executeButton.addEventListener("click", openExecuteModal);
   elements.cancelExecuteButton.addEventListener("click", closeExecuteModal);
   elements.confirmExecuteButton.addEventListener("click", executeDedupe);
+  elements.stopExecuteButton.addEventListener("click", stopExecute);
   elements.logToggle.addEventListener("click", toggleLogPanel);
+
+  // Algorithm radio buttons
+  document.querySelectorAll('input[name="algorithm"]').forEach((radio) => {
+    radio.addEventListener("change", () => {
+      state.algorithm = radio.value;
+      elements.aiConfigPanel.style.display = radio.value === "ai" ? "block" : "none";
+    });
+  });
 
   // Close modal on backdrop click
   const backdrop = $(".modal-backdrop");
@@ -326,11 +345,15 @@ async function startScan() {
   }
 
   try {
-    // Actual server uses query param: POST /api/scan?root=...
-    const payload = await api(
-      `/api/scan?root=${encodeURIComponent(selectedPath)}`,
-      { method: "POST" }
-    );
+    // Build scan URL with algorithm params
+    let scanUrl = `/api/scan?root=${encodeURIComponent(selectedPath)}`;
+    scanUrl += `&algorithm=${encodeURIComponent(state.algorithm)}`;
+    if (state.algorithm === "ai") {
+      scanUrl += `&ai_url=${encodeURIComponent(elements.aiUrlInput.value.trim())}`;
+      scanUrl += `&ai_key=${encodeURIComponent(elements.aiKeyInput.value.trim())}`;
+      scanUrl += `&ai_model=${encodeURIComponent(elements.aiModelInput.value.trim())}`;
+    }
+    const payload = await api(scanUrl, { method: "POST" });
 
     state.taskId = payload.task_id;
     elements.progressText.textContent = "扫描中";
@@ -652,6 +675,12 @@ function openExecuteModal() {
   );
   const backupDir = elements.backupDirInput.value.trim() || "默认备份目录";
   elements.modalBody.textContent = `将处理 ${state.groups.length} 个重复分组（共 ${duplicateCount} 个重复文件），移动到 ${backupDir}。此操作不可撤销。`;
+
+  // Reset modal UI: show confirm/cancel, hide progress
+  document.querySelector('.modal-actions').style.display = '';
+  elements.executeProgress.style.display = 'none';
+  elements.executeProgressFill.style.width = '0%';
+
   elements.executeModal.classList.add("visible");
 }
 
@@ -660,28 +689,69 @@ function closeExecuteModal() {
 }
 
 async function executeDedupe() {
+  // Hide confirm UI, show progress
+  document.querySelector('.modal-actions').style.display = 'none';
+  elements.executeProgress.style.display = 'block';
+  elements.executeProgressText.textContent = '正在提交...';
+  elements.executeProgressFill.style.width = '0%';
+
   try {
-    // Actual server takes no body
-    const payload = await api("/api/execute", { method: "POST" });
-
-    closeExecuteModal();
-
-    const moved = payload.moved || 0;
-    const backupDir = payload.backup_dir || "未知";
-    const errors = payload.errors || [];
-
-    appendLog(
-      `执行去重完成，移动 ${moved} 个文件到 ${backupDir}`
-    );
-
-    if (errors.length > 0) {
-      errors.forEach((e) => appendLog("错误: " + e));
+    const result = await api("/api/execute", { method: "POST" });
+    if (result.error) {
+      elements.executeProgressText.textContent = result.error;
+      return;
     }
-
-    await loadGroups();
+    if (result.task_id) {
+      state.executeTaskId = result.task_id;
+      pollExecuteStatus(result.task_id);
+    }
   } catch (err) {
-    closeExecuteModal();
-    appendLog("执行去重失败: " + err.message);
+    elements.executeProgressText.textContent = `请求失败: ${err.message}`;
+  }
+}
+
+function pollExecuteStatus(taskId) {
+  const interval = setInterval(async () => {
+    try {
+      const status = await api(`/api/execute/${taskId}/status`);
+      const pct = status.total_count > 0
+        ? Math.round(status.moved_count / status.total_count * 100)
+        : 0;
+      elements.executeProgressFill.style.width = `${pct}%`;
+      elements.executeProgressText.textContent = status.progress_message || '处理中...';
+
+      if (status.status === "done" || status.status === "error" || status.status === "stopped") {
+        clearInterval(interval);
+        // Show final state briefly, then close modal and refresh
+        setTimeout(() => {
+          closeExecuteModal();
+          loadGroups();
+          if (status.status === "done") {
+            appendLog(`去重完成: ${status.moved_count} 个文件已移动到 ${status.backup_dir}`);
+          }
+          if (status.status === "error") {
+            appendLog(`去重失败: ${status.progress_message}`);
+          }
+          if (status.errors && status.errors.length > 0) {
+            status.errors.forEach((e) => appendLog("错误: " + e));
+          }
+        }, 1500);
+      }
+    } catch (err) {
+      clearInterval(interval);
+      elements.executeProgressText.textContent = `状态查询失败: ${err.message}`;
+    }
+  }, 500);
+}
+
+async function stopExecute() {
+  if (state.executeTaskId) {
+    try {
+      await api(`/api/execute/${state.executeTaskId}/stop`, { method: "POST" });
+      appendLog("已请求停止执行。");
+    } catch (err) {
+      appendLog("停止请求失败: " + err.message);
+    }
   }
 }
 

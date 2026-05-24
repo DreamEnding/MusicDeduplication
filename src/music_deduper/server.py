@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from .ai_dedupe import ai_find_duplicate_groups
 from .dedupe import default_backup_dir, default_rule_states, find_duplicate_groups, human_size
 from .models import AudioTrack, DuplicateGroup
 from .scanner import list_available_roots, scan_audio_files
@@ -39,6 +40,26 @@ class ScanTaskState:
     error: str = ""
     stop_event: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
+    algorithm: str = "builtin"
+    ai_url: str = ""
+    ai_key: str = ""
+    ai_model: str = ""
+
+
+@dataclass
+class ExecuteTaskState:
+    """Tracks the state of a single background execute task."""
+
+    task_id: str
+    status: str = "pending"  # pending | executing | done | error | stopped
+    progress_message: str = ""
+    moved_count: int = 0
+    total_count: int = 0
+    backup_dir: str = ""
+    errors: list[str] = field(default_factory=list)
+    error: str = ""
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
 
 
 @dataclass
@@ -46,6 +67,7 @@ class AppState:
     """Global application state shared across requests."""
 
     tasks: dict[str, ScanTaskState] = field(default_factory=dict)
+    execute_tasks: dict[str, ExecuteTaskState] = field(default_factory=dict)
     tracks: list[AudioTrack] = field(default_factory=list)
     groups: list[DuplicateGroup] = field(default_factory=list)
     scan_root: str = ""
@@ -60,6 +82,7 @@ APP_STATE = AppState()
 def reset_state() -> None:
     """Reset module-level state. Intended for test isolation."""
     APP_STATE.tasks.clear()
+    APP_STATE.execute_tasks.clear()
     APP_STATE.tracks.clear()
     APP_STATE.groups.clear()
     APP_STATE.scan_root = ""
@@ -137,7 +160,19 @@ def _run_scan(task: ScanTaskState) -> None:
         with APP_STATE.lock:
             APP_STATE.tracks = task.tracks
             APP_STATE.scan_root = task.root
-            APP_STATE.groups = find_duplicate_groups(task.tracks, APP_STATE.rule_states)
+
+            if task.algorithm == "ai" and task.ai_url and task.ai_key:
+                progress("使用 AI 算法进行去重分析...")
+                APP_STATE.groups = ai_find_duplicate_groups(
+                    task.tracks,
+                    APP_STATE.rule_states,
+                    api_url=task.ai_url,
+                    api_key=task.ai_key,
+                    model=task.ai_model or "gpt-4o-mini",
+                    progress=progress,
+                )
+            else:
+                APP_STATE.groups = find_duplicate_groups(task.tracks, APP_STATE.rule_states)
             task.groups = list(APP_STATE.groups)
 
         if task.stop_event.is_set():
@@ -149,6 +184,74 @@ def _run_scan(task: ScanTaskState) -> None:
         task.status = "error"
         task.error = str(exc)
         task.log.append(f"扫描出错: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Background execute worker
+# ---------------------------------------------------------------------------
+
+
+def _run_execute(task: ExecuteTaskState) -> None:
+    """Execute deduplication in a background thread, updating task state."""
+    task.status = "executing"
+    task.progress_message = "准备执行去重..."
+
+    try:
+        with APP_STATE.lock:
+            groups = list(APP_STATE.groups)
+
+        if not groups:
+            task.status = "error"
+            task.error = "no groups to process"
+            task.progress_message = "没有可处理的分组"
+            return
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        backup = default_backup_dir() / timestamp
+        backup.mkdir(parents=True, exist_ok=True)
+        task.backup_dir = str(backup)
+
+        total = sum(len(g.duplicate_tracks) for g in groups)
+        task.total_count = total
+        moved = 0
+
+        for group in groups:
+            for dup in group.duplicate_tracks:
+                if task.stop_event.is_set():
+                    task.status = "stopped"
+                    task.progress_message = f"已停止，已移动 {moved}/{total} 个文件"
+                    return
+                try:
+                    if dup.path.exists():
+                        shutil.move(str(dup.path), str(backup / dup.path.name))
+                        moved += 1
+                        task.moved_count = moved
+                        task.progress_message = f"正在移动文件 ({moved}/{total})..."
+                except Exception as exc:
+                    task.errors.append(f"{dup.path}: {exc}")
+
+        # Remove moved tracks from state
+        moved_paths: set[str] = set()
+        for g in groups:
+            for d in g.duplicate_tracks:
+                moved_paths.add(str(d.path))
+
+        with APP_STATE.lock:
+            APP_STATE.tracks = [t for t in APP_STATE.tracks if str(t.path) not in moved_paths]
+            # Recompute groups from remaining tracks for correctness
+            remaining = APP_STATE.tracks
+            if remaining:
+                APP_STATE.groups = find_duplicate_groups(remaining, APP_STATE.rule_states)
+            else:
+                APP_STATE.groups = []
+
+        task.progress_message = f"完成，已移动 {moved} 个文件到 {backup}"
+        task.status = "done"
+
+    except Exception as exc:
+        task.status = "error"
+        task.error = str(exc)
+        task.progress_message = f"执行出错: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -194,9 +297,22 @@ def create_app() -> FastAPI:
     # ---- POST /api/scan ----
 
     @app.post("/api/scan")
-    def start_scan(root: str) -> dict:
+    def start_scan(
+        root: str,
+        algorithm: str = "builtin",
+        ai_url: str = "",
+        ai_key: str = "",
+        ai_model: str = "",
+    ) -> dict:
         task_id = uuid.uuid4().hex[:8]
-        task = ScanTaskState(task_id=task_id, root=root)
+        task = ScanTaskState(
+            task_id=task_id,
+            root=root,
+            algorithm=algorithm,
+            ai_url=ai_url,
+            ai_key=ai_key,
+            ai_model=ai_model,
+        )
         APP_STATE.tasks[task_id] = task
         task.thread = threading.Thread(target=_run_scan, args=(task,), daemon=True)
         task.thread.start()
@@ -308,35 +424,40 @@ def create_app() -> FastAPI:
         if not groups:
             return {"error": "no groups to process"}
 
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        backup = default_backup_dir() / timestamp
-        backup.mkdir(parents=True, exist_ok=True)
+        task_id = uuid.uuid4().hex[:8]
+        total = sum(len(g.duplicate_tracks) for g in groups)
+        task = ExecuteTaskState(task_id=task_id, total_count=total)
+        APP_STATE.execute_tasks[task_id] = task
+        task.thread = threading.Thread(target=_run_execute, args=(task,), daemon=True)
+        task.thread.start()
+        return {"task_id": task_id}
 
-        moved = 0
-        errors: list[str] = []
+    # ---- GET /api/execute/{task_id}/status ----
 
-        for group in groups:
-            for dup in group.duplicate_tracks:
-                try:
-                    if dup.path.exists():
-                        shutil.move(str(dup.path), str(backup / dup.path.name))
-                        moved += 1
-                except Exception as exc:
-                    errors.append(f"{dup.path}: {exc}")
-
-        # Recompute groups after moving
-        remaining = [
-            t
-            for t in APP_STATE.tracks
-            if all(str(t.path) != str(d.path) for g in groups for d in g.duplicate_tracks)
-        ]
-        APP_STATE.groups = find_duplicate_groups(remaining, APP_STATE.rule_states)
-
+    @app.get("/api/execute/{task_id}/status")
+    def execute_status(task_id: str) -> dict:
+        task = APP_STATE.execute_tasks.get(task_id)
+        if task is None:
+            return {"error": "unknown task"}
         return {
-            "moved": moved,
-            "backup_dir": str(backup),
-            "errors": errors,
+            "task_id": task.task_id,
+            "status": task.status,
+            "progress_message": task.progress_message,
+            "moved_count": task.moved_count,
+            "total_count": task.total_count,
+            "backup_dir": task.backup_dir,
+            "errors": task.errors,
         }
+
+    # ---- POST /api/execute/{task_id}/stop ----
+
+    @app.post("/api/execute/{task_id}/stop")
+    def stop_execute(task_id: str) -> dict:
+        task = APP_STATE.execute_tasks.get(task_id)
+        if task is None:
+            return {"error": "unknown task"}
+        task.stop_event.set()
+        return {"status": "stopping"}
 
     # ---- GET /api/export ----
 

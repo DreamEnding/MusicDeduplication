@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import struct
 from dataclasses import replace
 from pathlib import Path
 
 from mutagen import File as MutagenFile
+from mutagen.id3 import ID3
 
 from .models import AudioTrack
 
-SUPPORTED_EXTENSIONS = {".mp3", ".flac", ".wav", ".aac", ".m4a", ".ogg", ".wma"}
+SUPPORTED_EXTENSIONS = {".mp3", ".flac", ".wav", ".aac", ".m4a", ".ogg", ".wma", ".dsf", ".alac"}
 
 
 def read_audio_track(path: Path, root: Path) -> AudioTrack:
@@ -18,6 +20,11 @@ def read_audio_track(path: Path, root: Path) -> AudioTrack:
         extension=path.suffix.lower(),
         size_bytes=path.stat().st_size,
     )
+
+    # DSF needs custom binary parsing — mutagen does not support it.
+    if base.extension == ".dsf":
+        return _enrich_dsf(base)
+
     try:
         mf = MutagenFile(path)
     except Exception as exc:
@@ -31,7 +38,7 @@ def read_audio_track(path: Path, root: Path) -> AudioTrack:
     try:
         if ext == ".mp3":
             return _enrich_mp3(base, mf)
-        if ext in {".m4a", ".mp4", ".aac"}:
+        if ext in {".m4a", ".mp4", ".aac", ".alac"}:
             return _enrich_mp4(base, mf)
         if ext == ".wma":
             return _enrich_wma(base, mf)
@@ -321,4 +328,106 @@ def _enrich_generic(track: AudioTrack, mf) -> AudioTrack:
         album=album,
         metadata_source="generic",
         **info,
+    )
+
+
+# ---------------------------------------------------------------------------
+# DSF (DSD Stream File) enrichment — custom binary parsing + ID3v2 tags
+# ---------------------------------------------------------------------------
+
+def _enrich_dsf(track: AudioTrack) -> AudioTrack:
+    """Parse DSF headers manually and read ID3v2 tags via mutagen."""
+    bitrate_kbps = None
+    duration_seconds = None
+    format_info = ""
+    title = ""
+    artist = ""
+    album = ""
+    year = None
+    genre = ""
+    track_number = None
+    has_cover = False
+
+    try:
+        with open(track.path, "rb") as f:
+            # -- DSD chunk -------------------------------------------------------
+            magic = f.read(4)
+            if magic != b"DSD ":
+                track.warnings.append("DSF: missing DSD magic bytes")
+                return replace(track, metadata_source="DSF")
+
+            dsd_chunk_size = struct.unpack("<Q", f.read(8))[0]
+            # Skip remainder of DSD chunk (chunk_size includes the 12 bytes
+            # already read: 4 magic + 8 size)
+            if dsd_chunk_size > 12:
+                f.seek(dsd_chunk_size - 12, 1)
+
+            # -- fmt chunk -------------------------------------------------------
+            fmt_magic = f.read(4)
+            if fmt_magic != b"fmt ":
+                track.warnings.append("DSF: missing fmt chunk")
+                return replace(track, metadata_source="DSF")
+
+            fmt_chunk_size = struct.unpack("<Q", f.read(8))[0]
+            fmt_data = f.read(fmt_chunk_size - 12)  # 4 magic + 8 size already read
+
+            if len(fmt_data) < 32:
+                # We need at least 24 bytes of u32 fields + 8 bytes u64 sample_count
+                track.warnings.append("DSF: fmt chunk truncated")
+                return replace(track, metadata_source="DSF")
+
+            # fmt chunk layout (all little-endian):
+            #   format_version  (u32)  offset 0
+            #   format_id       (u32)  offset 4
+            #   channel_type    (u32)  offset 8
+            #   channel_count   (u32)  offset 12
+            #   sampling_freq   (u32)  offset 16
+            #   bits_per_sample (u32)  offset 20
+            #   sample_count    (u64)  offset 24
+            (_, _, _, channel_count, sampling_freq, bits_per_sample) = (
+                struct.unpack_from("<6I", fmt_data, 0)
+            )
+            sample_count = struct.unpack_from("<Q", fmt_data, 24)[0]
+
+            if sampling_freq > 0:
+                duration_seconds = sample_count / sampling_freq
+                bitrate_kbps = int(
+                    sampling_freq * bits_per_sample * channel_count / 1000
+                )
+
+            # Human-readable format info
+            sr_mhz = sampling_freq / 1_000_000
+            format_info = f"DSD, {sr_mhz:.1f} MHz, {bits_per_sample}-bit"
+
+    except Exception as exc:
+        track.warnings.append(f"DSF header parse error: {exc}")
+        return replace(track, metadata_source="DSF")
+
+    # -- ID3v2 tags (DSF embeds ID3v2 at the end of the file) ----------------
+    try:
+        id3_tags = ID3(track.path)
+        title = _id3_text(id3_tags, "TIT2")
+        artist = _id3_text(id3_tags, "TPE1")
+        album = _id3_text(id3_tags, "TALB")
+        year = _safe_int(_id3_text(id3_tags, "TDRC"))
+        genre = _id3_text(id3_tags, "TCON")
+        track_number = _safe_int(_id3_text(id3_tags, "TRCK"))
+        has_cover = id3_tags.get("APIC") is not None
+    except Exception:
+        # No ID3 tags or unreadable — that is acceptable for DSF
+        pass
+
+    return replace(
+        track,
+        title=title,
+        artist=artist,
+        album=album,
+        year=year,
+        genre=genre,
+        track_number=track_number,
+        has_cover=has_cover,
+        metadata_source="DSF",
+        bitrate_kbps=bitrate_kbps,
+        duration_seconds=duration_seconds,
+        format_info=format_info,
     )

@@ -47,6 +47,28 @@
           <input id="backupDirInput" class="input" type="text" placeholder="D:\MusicDeduplicationBackups">
         </section>
 
+        <section class="panel">
+          <h2 class="panel-title">去重算法</h2>
+          <label class="toggle">
+            <input type="radio" name="algorithm" value="builtin" checked>
+            <span>内置算法</span>
+          </label>
+          <label class="toggle">
+            <input type="radio" name="algorithm" value="ai">
+            <span>AI 算法</span>
+          </label>
+          <div id="aiConfigPanel" style="display:none; margin-top:10px;">
+            <label class="field-label" for="aiUrlInput">API URL</label>
+            <input id="aiUrlInput" class="input" type="text"
+                   value="https://api.openai.com/v1/chat/completions"
+                   placeholder="OpenAI 兼容接口地址">
+            <label class="field-label" for="aiKeyInput">API Key</label>
+            <input id="aiKeyInput" class="input" type="password" placeholder="sk-...">
+            <label class="field-label" for="aiModelInput">模型</label>
+            <input id="aiModelInput" class="input" type="text" value="gpt-4o-mini" placeholder="gpt-4o-mini">
+          </div>
+        </section>
+
         <section class="panel actions">
           <button id="scanButton" class="button button-primary" type="button">开始扫描</button>
           <button id="stopButton" class="button button-secondary" type="button">停止扫描</button>
@@ -126,6 +148,13 @@
         <div class="modal-actions">
           <button id="cancelExecuteButton" class="button button-secondary" type="button">取消</button>
           <button id="confirmExecuteButton" class="button button-primary" type="button">确认执行</button>
+        </div>
+        <div id="executeProgress" class="execute-progress" style="display:none;">
+          <p id="executeProgressText" class="progress-text">准备中...</p>
+          <div class="progress-bar">
+            <div id="executeProgressFill" class="progress-fill"></div>
+          </div>
+          <button id="stopExecuteButton" class="button button-secondary" type="button" style="margin-top:12px;">停止</button>
         </div>
       </div>
     </div>
