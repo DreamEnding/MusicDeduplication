@@ -1,6 +1,13 @@
-.pytest_cache/
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
 dist/
 build/
-reports/
+
+# Test / tool cache
+.pytest_cache/
+
+# Project output
+src/music_deduper/static/report.json
