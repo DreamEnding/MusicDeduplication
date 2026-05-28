@@ -34,11 +34,27 @@ def ai_find_duplicate_groups(
     api_key: str,
     model: str,
     progress: Callable[[str], None] | None = None,
-) -> list[DuplicateGroup]:
+) -> tuple[list[DuplicateGroup], list[str]]:
+    """Find duplicate groups using AI.
+
+    Returns:
+        Tuple of (groups, warnings) where warnings contains any truncation messages.
+    """
     progress = progress or (lambda _: None)
 
     if not tracks:
-        return []
+        return [], []
+
+    warnings: list[str] = []
+    total_tracks = len(tracks)
+    max_tracks = BATCH_SIZE * MAX_BATCHES
+
+    if total_tracks > max_tracks:
+        warnings.append(
+            f"警告: 共 {total_tracks} 首音频，超出 AI 分析上限 {max_tracks} 首。"
+            f"仅分析前 {max_tracks} 首，剩余 {total_tracks - max_tracks} 首将被忽略。"
+        )
+        progress(warnings[-1])
 
     groups: list[DuplicateGroup] = []
     batches = _make_batches(tracks)
@@ -58,7 +74,7 @@ def ai_find_duplicate_groups(
         groups.extend(batch_groups)
 
     progress(f"AI 分析完成，识别到 {len(groups)} 组重复。")
-    return groups
+    return groups, warnings
 
 
 def _make_batches(tracks: list[AudioTrack]) -> list[tuple[list[AudioTrack], int]]:

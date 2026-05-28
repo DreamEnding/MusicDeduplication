@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import threading
@@ -9,15 +10,33 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .ai_dedupe import ai_find_duplicate_groups
+from .config import get_settings
 from .dedupe import default_backup_dir, default_rule_states, find_duplicate_groups, human_size
 from .models import AudioTrack, DuplicateGroup
 from .scanner import list_available_roots, scan_audio_files
+
+# Load settings
+settings = get_settings()
+
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(settings.log_file, encoding="utf-8"),
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +63,7 @@ class ScanTaskState:
     ai_url: str = ""
     ai_key: str = ""
     ai_model: str = ""
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass
@@ -60,6 +80,7 @@ class ExecuteTaskState:
     error: str = ""
     stop_event: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass
@@ -79,6 +100,32 @@ class AppState:
 APP_STATE = AppState()
 
 
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
+
+
+class ScanRequest(BaseModel):
+    """Request model for scan endpoint."""
+    root: str
+    algorithm: Literal["builtin", "ai"] = "builtin"
+    ai_url: Optional[str] = ""
+    ai_key: Optional[str] = ""
+    ai_model: Optional[str] = ""
+
+
+class RuleState(BaseModel):
+    """Rule state model."""
+    key: str
+    label: str
+    enabled: bool
+
+
+class RulesUpdateRequest(BaseModel):
+    """Request model for rules update endpoint."""
+    rules: list[RuleState]
+
+
 def reset_state() -> None:
     """Reset module-level state. Intended for test isolation."""
     APP_STATE.tasks.clear()
@@ -94,6 +141,47 @@ def reset_state() -> None:
 # ---------------------------------------------------------------------------
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def _validate_path(path_str: str, allowed_roots: list[str] | None = None) -> Path:
+    """Validate and resolve a path, ensuring it's within allowed roots.
+
+    Args:
+        path_str: The path string to validate
+        allowed_roots: List of allowed root directories. If None, uses available drive roots.
+
+    Returns:
+        Resolved Path object
+
+    Raises:
+        HTTPException: If path is invalid or not within allowed roots
+    """
+    if not path_str:
+        raise HTTPException(status_code=400, detail="Path cannot be empty")
+
+    try:
+        target = Path(path_str).resolve()
+    except (ValueError, OSError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid path: {e}")
+
+    # Get allowed roots if not provided
+    if allowed_roots is None:
+        allowed_roots = list_available_roots()
+
+    # Check if path is under any allowed root
+    for root in allowed_roots:
+        try:
+            root_path = Path(root).resolve()
+            # Check if target is the root itself or a subdirectory
+            if target == root_path or root_path in target.parents:
+                return target
+        except (ValueError, OSError):
+            continue
+
+    raise HTTPException(
+        status_code=403,
+        detail=f"Access denied: path must be within allowed directories: {allowed_roots}"
+    )
 
 
 def _group_id(index: int, group: DuplicateGroup) -> str:
@@ -120,6 +208,7 @@ def _track_to_dict(track: AudioTrack) -> dict:
     return {
         "path": str(track.path),
         "root": str(track.root),
+        "relative_path": track.relative_path,
         "extension": track.extension,
         "size_bytes": track.size_bytes,
         "size_display": human_size(track.size_bytes),
@@ -147,6 +236,7 @@ def _run_scan(task: ScanTaskState) -> None:
     """Execute a scan in a background thread, updating task state."""
     task.status = "scanning"
     task.log.append(f"开始扫描 {task.root}")
+    logger.info(f"Starting scan task {task.task_id} for root: {task.root}")
 
     def progress(msg: str) -> None:
         task.progress_message = msg
@@ -163,7 +253,7 @@ def _run_scan(task: ScanTaskState) -> None:
 
             if task.algorithm == "ai" and task.ai_url and task.ai_key:
                 progress("使用 AI 算法进行去重分析...")
-                APP_STATE.groups = ai_find_duplicate_groups(
+                groups, warnings = ai_find_duplicate_groups(
                     task.tracks,
                     APP_STATE.rule_states,
                     api_url=task.ai_url,
@@ -171,19 +261,25 @@ def _run_scan(task: ScanTaskState) -> None:
                     model=task.ai_model or "gpt-4o-mini",
                     progress=progress,
                 )
+                APP_STATE.groups = groups
+                for warning in warnings:
+                    progress(f"⚠️ {warning}")
             else:
                 APP_STATE.groups = find_duplicate_groups(task.tracks, APP_STATE.rule_states)
             task.groups = list(APP_STATE.groups)
 
         if task.stop_event.is_set():
             task.status = "stopped"
+            logger.info(f"Scan task {task.task_id} stopped by user")
         else:
             task.status = "done"
         task.log.append(f"扫描完成，发现 {len(task.groups)} 组重复。")
+        logger.info(f"Scan task {task.task_id} completed: {len(task.groups)} groups found")
     except Exception as exc:
         task.status = "error"
         task.error = str(exc)
         task.log.append(f"扫描出错: {exc}")
+        logger.error(f"Scan task {task.task_id} failed: {exc}", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +291,7 @@ def _run_execute(task: ExecuteTaskState) -> None:
     """Execute deduplication in a background thread, updating task state."""
     task.status = "executing"
     task.progress_message = "准备执行去重..."
+    logger.info(f"Starting execute task {task.task_id}")
 
     try:
         with APP_STATE.lock:
@@ -204,12 +301,14 @@ def _run_execute(task: ExecuteTaskState) -> None:
             task.status = "error"
             task.error = "no groups to process"
             task.progress_message = "没有可处理的分组"
+            logger.warning(f"Execute task {task.task_id}: no groups to process")
             return
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         backup = default_backup_dir() / timestamp
         backup.mkdir(parents=True, exist_ok=True)
         task.backup_dir = str(backup)
+        logger.info(f"Execute task {task.task_id}: backup directory {backup}")
 
         total = sum(len(g.duplicate_tracks) for g in groups)
         task.total_count = total
@@ -220,6 +319,7 @@ def _run_execute(task: ExecuteTaskState) -> None:
                 if task.stop_event.is_set():
                     task.status = "stopped"
                     task.progress_message = f"已停止，已移动 {moved}/{total} 个文件"
+                    logger.info(f"Execute task {task.task_id} stopped by user")
                     return
                 try:
                     if dup.path.exists():
@@ -229,6 +329,7 @@ def _run_execute(task: ExecuteTaskState) -> None:
                         task.progress_message = f"正在移动文件 ({moved}/{total})..."
                 except Exception as exc:
                     task.errors.append(f"{dup.path}: {exc}")
+                    logger.error(f"Execute task {task.task_id}: failed to move {dup.path}: {exc}")
 
         # Remove moved tracks from state
         moved_paths: set[str] = set()
@@ -245,13 +346,33 @@ def _run_execute(task: ExecuteTaskState) -> None:
             else:
                 APP_STATE.groups = []
 
-        task.progress_message = f"完成，已移动 {moved} 个文件到 {backup}"
-        task.status = "done"
+        # Check error rate and set appropriate status
+        error_count = len(task.errors)
+        if total > 0 and error_count > 0:
+            error_rate = error_count / total
+            if error_rate >= 0.5:  # More than 50% failed
+                task.status = "error"
+                task.error = f"高错误率: {error_count}/{total} 个文件移动失败"
+                task.progress_message = f"执行失败: {error_count}/{total} 个文件移动失败"
+                logger.error(f"Execute task {task.task_id}: high error rate {error_count}/{total}")
+            elif error_count > 0:
+                task.status = "partial_failure"
+                task.progress_message = f"部分完成: {moved} 个文件已移动，{error_count} 个失败"
+                logger.warning(f"Execute task {task.task_id}: partial failure {moved} moved, {error_count} failed")
+            else:
+                task.progress_message = f"完成，已移动 {moved} 个文件到 {backup}"
+                task.status = "done"
+        else:
+            task.progress_message = f"完成，已移动 {moved} 个文件到 {backup}"
+            task.status = "done"
+
+        logger.info(f"Execute task {task.task_id} completed: {moved} files moved")
 
     except Exception as exc:
         task.status = "error"
         task.error = str(exc)
         task.progress_message = f"执行出错: {exc}"
+        logger.error(f"Execute task {task.task_id} failed: {exc}", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -259,14 +380,54 @@ def _run_execute(task: ExecuteTaskState) -> None:
 # ---------------------------------------------------------------------------
 
 
+class CSRFMiddleware(BaseHTTPMiddleware):
+    """Middleware to check Origin header for state-changing requests."""
+
+    def __init__(self, app, allowed_origins: list[str] | None = None):
+        super().__init__(app)
+        self.allowed_origins = set(allowed_origins or settings.allowed_origins)
+
+    async def dispatch(self, request: Request, call_next):
+        # Only check state-changing methods
+        if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+            origin = request.headers.get("origin", "")
+            if origin:
+                # Extract origin without port
+                from urllib.parse import urlparse
+                parsed = urlparse(origin)
+                origin_base = f"{parsed.scheme}://{parsed.hostname}"
+                if origin_base not in self.allowed_origins:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="CSRF check failed: Origin not allowed"
+                    )
+        return await call_next(request)
+
+
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
 
     app = FastAPI(title="Music Deduplication", version="0.1.0")
 
+    # Add CSRF middleware
+    app.add_middleware(CSRFMiddleware)
+
     # Mount static files so the frontend can be served
     _STATIC_DIR.mkdir(parents=True, exist_ok=True)
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+    # ---- GET /api/health ----
+
+    @app.get("/api/health")
+    def health_check() -> dict:
+        """Health check endpoint."""
+        return {
+            "status": "healthy",
+            "version": "0.1.0",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "active_scan_tasks": len([t for t in APP_STATE.tasks.values() if t.status == "scanning"]),
+            "active_execute_tasks": len([t for t in APP_STATE.execute_tasks.values() if t.status == "executing"]),
+        }
 
     # ---- GET /api/roots ----
 
@@ -282,7 +443,8 @@ def create_app() -> FastAPI:
         if not path:
             return {"path": "", "parent": "", "children": list_available_roots()}
         try:
-            target = Path(path)
+            # Validate path is within allowed roots
+            target = _validate_path(path)
             if not target.exists() or not target.is_dir():
                 return {"path": path, "parent": "", "children": []}
             children = sorted(
@@ -291,27 +453,29 @@ def create_app() -> FastAPI:
             )
             parent = str(target.parent) if target.parent != target else ""
             return {"path": str(target), "parent": parent, "children": children}
+        except HTTPException:
+            raise
         except (PermissionError, OSError):
             return {"path": path, "parent": "", "children": []}
 
     # ---- POST /api/scan ----
 
     @app.post("/api/scan")
-    def start_scan(
-        root: str,
-        algorithm: str = "builtin",
-        ai_url: str = "",
-        ai_key: str = "",
-        ai_model: str = "",
-    ) -> dict:
+    def start_scan(request: ScanRequest) -> dict:
+        # Validate root path is within allowed directories
+        try:
+            _validate_path(request.root)
+        except HTTPException:
+            raise
+
         task_id = uuid.uuid4().hex[:8]
         task = ScanTaskState(
             task_id=task_id,
-            root=root,
-            algorithm=algorithm,
-            ai_url=ai_url,
-            ai_key=ai_key,
-            ai_model=ai_model,
+            root=request.root,
+            algorithm=request.algorithm,
+            ai_url=request.ai_url or "",
+            ai_key=request.ai_key or "",
+            ai_model=request.ai_model or "",
         )
         APP_STATE.tasks[task_id] = task
         task.thread = threading.Thread(target=_run_scan, args=(task,), daemon=True)
@@ -324,17 +488,18 @@ def create_app() -> FastAPI:
     def scan_status(task_id: str) -> dict:
         task = APP_STATE.tasks.get(task_id)
         if task is None:
-            return {"error": "unknown task"}
-        return {
-            "task_id": task.task_id,
-            "root": task.root,
-            "status": task.status,
-            "progress_message": task.progress_message,
-            "processed_files": task.processed_files,
-            "groups_found": len(task.groups),
-            "log": task.log,
-            "error": task.error,
-        }
+            raise HTTPException(status_code=404, detail="unknown task")
+        with task.lock:
+            return {
+                "task_id": task.task_id,
+                "root": task.root,
+                "status": task.status,
+                "progress_message": task.progress_message,
+                "processed_files": task.processed_files,
+                "groups_found": len(task.groups),
+                "log": list(task.log),
+                "error": task.error,
+            }
 
     # ---- POST /api/scan/{task_id}/stop ----
 
@@ -342,9 +507,21 @@ def create_app() -> FastAPI:
     def stop_scan(task_id: str) -> dict:
         task = APP_STATE.tasks.get(task_id)
         if task is None:
-            return {"error": "unknown task"}
+            raise HTTPException(status_code=404, detail="unknown task")
         task.stop_event.set()
         return {"status": "stopping"}
+
+    # ---- PUT /api/rules ----
+
+    @app.put("/api/rules")
+    def update_rules(request: RulesUpdateRequest) -> dict:
+        """Update rule states from frontend."""
+        with APP_STATE.lock:
+            APP_STATE.rule_states = [
+                {"key": r.key, "label": r.label, "enabled": r.enabled}
+                for r in request.rules
+            ]
+        return {"status": "ok", "rules": APP_STATE.rule_states}
 
     # ---- GET /api/groups ----
 
@@ -386,7 +563,7 @@ def create_app() -> FastAPI:
             for i, g in enumerate(APP_STATE.groups):
                 if _group_id(i, g) == group_id:
                     return _group_to_dict(i, g)
-        return {"error": "group not found"}
+        raise HTTPException(status_code=404, detail="group not found")
 
     # ---- PUT /api/groups/{group_id}/keep ----
 
@@ -402,7 +579,7 @@ def create_app() -> FastAPI:
                             target = t
                             break
                     if target is None:
-                        return {"error": "track not found in group"}
+                        raise HTTPException(status_code=404, detail="track not found in group")
 
                     # Replace keep_track and rebuild duplicate list
                     APP_STATE.groups[i] = DuplicateGroup(
@@ -412,7 +589,7 @@ def create_app() -> FastAPI:
                         duplicate_tracks=[t for t in g.tracks if t.path != target.path],
                     )
                     return _group_to_dict(i, APP_STATE.groups[i])
-        return {"error": "group not found"}
+        raise HTTPException(status_code=404, detail="group not found")
 
     # ---- POST /api/execute ----
 
@@ -422,7 +599,7 @@ def create_app() -> FastAPI:
             groups = list(APP_STATE.groups)
 
         if not groups:
-            return {"error": "no groups to process"}
+            raise HTTPException(status_code=400, detail="no groups to process")
 
         task_id = uuid.uuid4().hex[:8]
         total = sum(len(g.duplicate_tracks) for g in groups)
@@ -438,16 +615,17 @@ def create_app() -> FastAPI:
     def execute_status(task_id: str) -> dict:
         task = APP_STATE.execute_tasks.get(task_id)
         if task is None:
-            return {"error": "unknown task"}
-        return {
-            "task_id": task.task_id,
-            "status": task.status,
-            "progress_message": task.progress_message,
-            "moved_count": task.moved_count,
-            "total_count": task.total_count,
-            "backup_dir": task.backup_dir,
-            "errors": task.errors,
-        }
+            raise HTTPException(status_code=404, detail="unknown task")
+        with task.lock:
+            return {
+                "task_id": task.task_id,
+                "status": task.status,
+                "progress_message": task.progress_message,
+                "moved_count": task.moved_count,
+                "total_count": task.total_count,
+                "backup_dir": task.backup_dir,
+                "errors": list(task.errors),
+            }
 
     # ---- POST /api/execute/{task_id}/stop ----
 
@@ -455,7 +633,7 @@ def create_app() -> FastAPI:
     def stop_execute(task_id: str) -> dict:
         task = APP_STATE.execute_tasks.get(task_id)
         if task is None:
-            return {"error": "unknown task"}
+            raise HTTPException(status_code=404, detail="unknown task")
         task.stop_event.set()
         return {"status": "stopping"}
 

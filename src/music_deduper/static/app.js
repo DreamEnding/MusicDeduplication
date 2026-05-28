@@ -5,6 +5,52 @@
 
 // ---- Application state ----
 
+const STORAGE_KEY = "music_dedup_state";
+
+const defaultRules = [
+  { key: "metadata_complete", label: "信息更完整优先", enabled: true },
+  { key: "higher_bitrate", label: "码率更高优先", enabled: true },
+  { key: "has_cover", label: "带封面优先", enabled: true },
+  { key: "larger_file", label: "文件更大优先", enabled: false },
+  { key: "shorter_path", label: "路径更短优先", enabled: false },
+];
+
+function loadSavedState() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      return {
+        selectedRoot: parsed.selectedRoot || "",
+        previewOnly: parsed.previewOnly || false,
+        backupDir: parsed.backupDir || "",
+        algorithm: parsed.algorithm || "builtin",
+        rules: parsed.rules || defaultRules,
+      };
+    }
+  } catch (e) {
+    console.warn("Failed to load saved state:", e);
+  }
+  return null;
+}
+
+function saveState() {
+  try {
+    const toSave = {
+      selectedRoot: state.selectedRoot,
+      previewOnly: state.previewOnly,
+      backupDir: state.backupDir,
+      algorithm: state.algorithm,
+      rules: state.rules,
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
+  } catch (e) {
+    console.warn("Failed to save state:", e);
+  }
+}
+
+const savedState = loadSavedState();
+
 const state = {
   taskId: "",
   groups: [],
@@ -16,19 +62,14 @@ const state = {
   },
   allArtists: [],
   pollingHandle: null,
-  selectedRoot: "",
+  pollingStartTime: null,
+  selectedRoot: savedState?.selectedRoot || "",
   selectedFolderPath: "",
-  previewOnly: false,
-  backupDir: "",
+  previewOnly: savedState?.previewOnly || false,
+  backupDir: savedState?.backupDir || "",
   executeTaskId: null,
-  algorithm: "builtin",
-  rules: [
-    { key: "metadata_complete", label: "信息更完整优先", enabled: true },
-    { key: "higher_bitrate", label: "码率更高优先", enabled: true },
-    { key: "has_cover", label: "带封面优先", enabled: true },
-    { key: "larger_file", label: "文件更大优先", enabled: false },
-    { key: "shorter_path", label: "路径更短优先", enabled: false },
-  ],
+  algorithm: savedState?.algorithm || "builtin",
+  rules: savedState?.rules || defaultRules,
 };
 
 // ---- Cached DOM references ----
@@ -104,25 +145,46 @@ function animateValue(el, start, end, duration) {
 // ---- API helper ----
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    headers: {
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
-    ...options,
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
 
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(text || `${response.status} ${response.statusText}`);
-  }
+  try {
+    const response = await fetch(path, {
+      headers: {
+        "Content-Type": "application/json",
+        ...(options.headers || {}),
+      },
+      signal: controller.signal,
+      ...options,
+    });
 
-  const contentType = response.headers.get("content-type") || "";
-  if (contentType.includes("application/json")) {
-    return response.json();
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      let errorMessage;
+      try {
+        const json = JSON.parse(text);
+        errorMessage = json.detail || text;
+      } catch {
+        errorMessage = text || `${response.status} ${response.statusText}`;
+      }
+      throw new Error(errorMessage);
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      return response.json();
+    }
+    // Blob for file downloads (e.g. export)
+    return response.blob();
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (err.name === "AbortError") {
+      throw new Error("请求超时，请检查网络连接");
+    }
+    throw err;
   }
-  // Blob for file downloads (e.g. export)
-  return response.blob();
 }
 
 // ---- Initialization ----
@@ -132,6 +194,16 @@ function init() {
   renderRules();
   loadRoots();
   loadGroups();
+
+  // Restore saved state to UI
+  if (savedState) {
+    elements.previewToggle.checked = state.previewOnly;
+    elements.backupDirInput.value = state.backupDir;
+    if (state.algorithm === "ai") {
+      elements.aiConfigPanel.style.display = "block";
+      document.querySelector('input[name="algorithm"][value="ai"]').checked = true;
+    }
+  }
 }
 
 function bindEvents() {
@@ -143,9 +215,11 @@ function bindEvents() {
   });
   elements.previewToggle.addEventListener("change", () => {
     state.previewOnly = elements.previewToggle.checked;
+    saveState();
   });
   elements.backupDirInput.addEventListener("input", () => {
     state.backupDir = elements.backupDirInput.value.trim();
+    saveState();
   });
   elements.scanButton.addEventListener("click", startScan);
   elements.stopButton.addEventListener("click", stopScan);
@@ -164,6 +238,7 @@ function bindEvents() {
     radio.addEventListener("change", () => {
       state.algorithm = radio.value;
       elements.aiConfigPanel.style.display = radio.value === "ai" ? "block" : "none";
+      saveState();
     });
   });
 
@@ -318,6 +393,7 @@ function onRuleAction(event) {
 
   if (action === "toggle") {
     state.rules[index].enabled = event.currentTarget.checked;
+    syncRulesToBackend();
     return;
   }
   if (action === "up" && index > 0) {
@@ -332,7 +408,20 @@ function onRuleAction(event) {
       state.rules[index + 1],
     ];
   }
+  syncRulesToBackend();
   renderRules();
+}
+
+async function syncRulesToBackend() {
+  saveState();
+  try {
+    await api("/api/rules", {
+      method: "PUT",
+      body: JSON.stringify({ rules: state.rules }),
+    });
+  } catch (err) {
+    console.error("Failed to sync rules:", err);
+  }
 }
 
 // ---- Scan lifecycle ----
@@ -345,15 +434,20 @@ async function startScan() {
   }
 
   try {
-    // Build scan URL with algorithm params
-    let scanUrl = `/api/scan?root=${encodeURIComponent(selectedPath)}`;
-    scanUrl += `&algorithm=${encodeURIComponent(state.algorithm)}`;
+    // Build scan request body
+    const scanBody = {
+      root: selectedPath,
+      algorithm: state.algorithm,
+    };
     if (state.algorithm === "ai") {
-      scanUrl += `&ai_url=${encodeURIComponent(elements.aiUrlInput.value.trim())}`;
-      scanUrl += `&ai_key=${encodeURIComponent(elements.aiKeyInput.value.trim())}`;
-      scanUrl += `&ai_model=${encodeURIComponent(elements.aiModelInput.value.trim())}`;
+      scanBody.ai_url = elements.aiUrlInput.value.trim();
+      scanBody.ai_key = elements.aiKeyInput.value.trim();
+      scanBody.ai_model = elements.aiModelInput.value.trim();
     }
-    const payload = await api(scanUrl, { method: "POST" });
+    const payload = await api("/api/scan", {
+      method: "POST",
+      body: JSON.stringify(scanBody),
+    });
 
     state.taskId = payload.task_id;
     elements.progressText.textContent = "扫描中";
@@ -370,8 +464,19 @@ async function startScan() {
 
 function startPolling() {
   stopPolling();
+  state.pollingStartTime = Date.now();
   state.pollingHandle = window.setInterval(async () => {
     if (!state.taskId) return;
+
+    // Check timeout (5 minutes max)
+    const elapsed = Date.now() - state.pollingStartTime;
+    if (elapsed > 300000) {
+      stopPolling();
+      elements.scanButton.disabled = false;
+      appendLog("扫描超时（5分钟），已停止轮询。");
+      elements.progressText.textContent = "扫描超时";
+      return;
+    }
 
     try {
       const payload = await api(`/api/scan/${state.taskId}/status`);
@@ -457,7 +562,7 @@ async function loadGroups() {
     };
 
     // Collect unique artists from all groups for the filter dropdown
-    collectArtors();
+    collectArtists();
 
     renderStats(prevStats);
     renderArtistFilter();
@@ -467,7 +572,7 @@ async function loadGroups() {
   }
 }
 
-function collectArtors() {
+function collectArtists() {
   const artistSet = new Set();
   state.groups.forEach((group) => {
     (group.tracks || []).forEach((track) => {
@@ -581,6 +686,13 @@ function renderGroupDetails(group, container) {
   }
 }
 
+function escapeHtml(text) {
+  if (!text) return "";
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+
 function fillTrackDetails(container, track) {
   const rows = [
     ["标题", track.title || "(空)"],
@@ -600,7 +712,7 @@ function fillTrackDetails(container, track) {
   ];
 
   container.innerHTML = rows
-    .map(([label, value]) => `<dt>${label}</dt><dd>${value}</dd>`)
+    .map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(String(value))}</dd>`)
     .join("");
 }
 
@@ -711,7 +823,20 @@ async function executeDedupe() {
 }
 
 function pollExecuteStatus(taskId) {
+  const startTime = Date.now();
   const interval = setInterval(async () => {
+    // Check timeout (10 minutes max for execute)
+    const elapsed = Date.now() - startTime;
+    if (elapsed > 600000) {
+      clearInterval(interval);
+      elements.executeProgressText.textContent = "执行超时（10分钟），已停止轮询。";
+      setTimeout(() => {
+        closeExecuteModal();
+        loadGroups();
+      }, 2000);
+      return;
+    }
+
     try {
       const status = await api(`/api/execute/${taskId}/status`);
       const pct = status.total_count > 0
@@ -720,7 +845,7 @@ function pollExecuteStatus(taskId) {
       elements.executeProgressFill.style.width = `${pct}%`;
       elements.executeProgressText.textContent = status.progress_message || '处理中...';
 
-      if (status.status === "done" || status.status === "error" || status.status === "stopped") {
+      if (status.status === "done" || status.status === "error" || status.status === "stopped" || status.status === "partial_failure") {
         clearInterval(interval);
         // Show final state briefly, then close modal and refresh
         setTimeout(() => {
@@ -728,6 +853,9 @@ function pollExecuteStatus(taskId) {
           loadGroups();
           if (status.status === "done") {
             appendLog(`去重完成: ${status.moved_count} 个文件已移动到 ${status.backup_dir}`);
+          }
+          if (status.status === "partial_failure") {
+            appendLog(`去重部分完成: ${status.moved_count} 个文件已移动，部分失败`);
           }
           if (status.status === "error") {
             appendLog(`去重失败: ${status.progress_message}`);
