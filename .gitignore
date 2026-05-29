@@ -9,5 +9,27 @@ build/
 # Test / tool cache
 .pytest_cache/
 
+# Runtime logs
+*.log
+music_deduper.log
+
+# Node (not needed for Python project)
+package-lock.json
+node_modules/
+
+# Development tools
+.claude/
+.superpowers/
+
+# Development docs (design specs, plans)
+docs/
+
 # Project output
 src/music_deduper/static/report.json
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
