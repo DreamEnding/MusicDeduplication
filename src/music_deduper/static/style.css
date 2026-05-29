@@ -888,4 +888,355 @@ textarea {
   .toolbar-group .input {
     width: 100%;
   }
+
+  .track-table-wrap {
+    overflow-x: auto;
+  }
+}
+
+/* ---- Cover thumbnail in track table ---- */
+
+.col-cover {
+  width: 56px;
+  min-width: 56px;
+}
+
+.col-cover-cell {
+  padding: 6px 8px !important;
+  text-align: center;
+}
+
+.cover-thumb {
+  width: 44px;
+  height: 44px;
+  border-radius: 6px;
+  object-fit: cover;
+  display: block;
+  margin: 0 auto;
+  background: var(--secondary);
+}
+
+.cover-placeholder {
+  width: 44px;
+  height: 44px;
+  border-radius: 6px;
+  background: var(--secondary);
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  margin: 0 auto;
+}
+
+/* ---- Track table (file management mode) ---- */
+
+.track-table-wrap {
+  overflow-x: auto;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+
+.track-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.track-table thead {
+  background: var(--secondary);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.track-table th {
+  padding: 10px 12px;
+  text-align: left;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  user-select: none;
+}
+
+.track-table th.sortable {
+  cursor: pointer;
+  transition: color var(--duration-fast) var(--ease-out);
+}
+
+.track-table th.sortable:hover {
+  color: var(--text);
+}
+
+.track-table th.sort-asc::after {
+  content: " ↑";
+  font-size: 11px;
+}
+
+.track-table th.sort-desc::after {
+  content: " ↓";
+  font-size: 11px;
+}
+
+.track-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.track-table tbody tr.track-row {
+  cursor: pointer;
+  transition: background-color var(--duration-fast) var(--ease-out);
+}
+
+.track-table tbody tr.track-row:hover {
+  background: #f9fafb;
+}
+
+.track-table tbody tr.track-row:nth-child(even) {
+  background: #fcfcfd;
+}
+
+.track-table tbody tr.track-row:nth-child(even):hover {
+  background: #f3f4f6;
+}
+
+.track-table tbody tr.track-row.expanded {
+  background: #f0f4ff;
+}
+
+/* ---- Track detail row (edit form) ---- */
+
+.track-detail-row td {
+  padding: 0 !important;
+  border-bottom: 1px solid var(--border);
+  background: #fafbfd;
+}
+
+.track-edit-form {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 20px;
+  padding: 20px;
+}
+
+.edit-cover-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.edit-cover-img {
+  width: 140px;
+  height: 140px;
+  border-radius: 10px;
+  object-fit: cover;
+  background: var(--secondary);
+  border: 1px solid var(--border);
+}
+
+.edit-cover-upload-label {
+  cursor: pointer;
+  font-size: 13px;
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.edit-fields-section {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 20px;
+}
+
+.edit-field-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.edit-field-row label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.edit-field-lyrics {
+  grid-column: 1 / -1;
+}
+
+.lyrics-edit-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.edit-lyrics-status {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.edit-lyrics-preview {
+  display: none;
+  margin: 4px 0;
+  padding: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 150px;
+  overflow-y: auto;
+  font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+}
+
+.lyrics-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.lyrics-actions label {
+  cursor: pointer;
+  font-size: 13px;
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Lyrics column in table */
+.col-lyrics {
+  width: 40px;
+  text-align: center;
+}
+
+.edit-input {
+  min-height: 34px;
+  font-size: 13px;
+  padding: 0 10px;
+}
+
+.edit-readonly {
+  font-size: 13px;
+  color: var(--text);
+  padding: 6px 0;
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+.edit-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+/* ---- Pagination ---- */
+
+.pagination {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 0 4px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.pagination button {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #ffffff;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text);
+  transition: background-color var(--duration-fast) var(--ease-out);
+}
+
+.pagination button:hover:not(:disabled) {
+  background: var(--secondary);
+}
+
+.pagination button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.pagination .page-info {
+  padding: 0 8px;
+}
+
+/* ---- Checkbox column ---- */
+
+.col-check {
+  width: 40px;
+  min-width: 40px;
+  text-align: center;
+}
+
+.col-check-cell {
+  padding: 10px 8px !important;
+  text-align: center;
+}
+
+.col-check input[type="checkbox"],
+.col-check-cell input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
+/* ---- Batch edit bar ---- */
+
+.batch-edit-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 -2px 12px rgba(17, 24, 39, 0.08);
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.batch-count {
+  font-size: 14px;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.batch-edit-bar .input {
+  max-width: 140px;
+  min-height: 36px;
+  font-size: 13px;
+}
+
+@media (max-width: 640px) {
+  .batch-edit-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .batch-edit-bar .input {
+    max-width: 100%;
+  }
 }

@@ -43,7 +43,7 @@ def scan_audio_files(root: Path, progress: ProgressCallback | None = None, stop_
             processed += 1
             track = read_audio_track(file_path, root)
             tracks.append(track)
-            if processed % 25 == 0:
-                progress(f"已分析 {processed} 首音频: {track.relative_path}")
+            if processed % 5 == 0:
+                progress(f"正在分析 ({processed}): {track.relative_path}")
     progress(f"扫描结束，共识别到 {len(tracks)} 首音频文件。")
     return tracks

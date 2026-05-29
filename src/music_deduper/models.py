@@ -16,6 +16,7 @@ class AudioTrack:
     bitrate_kbps: int | None = None
     duration_seconds: float | None = None
     has_cover: bool = False
+    has_lyrics: bool = False
     metadata_source: str = ""
     year: int | None = None
     genre: str = ""

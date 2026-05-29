@@ -63,11 +63,17 @@ class TestMP3Metadata:
     def test_extracts_cover_art(self, mock_stat) -> None:
         mock_stat.return_value = _fake_stat()
 
+        apic_mock = MagicMock()
+        apic_mock.data = b'\xff\xd8\xff\xe0'
+        apic_mock.mime = "image/jpeg"
         mutagen_file = MagicMock()
         mutagen_file.info.bitrate = 128000
         mutagen_file.info.length = 180.0
-        mutagen_file.tags = {"TIT2": MagicMock(text=["Cover Song"])}
-        mutagen_file.get.return_value = MagicMock()  # APIC present
+        mutagen_file.tags = {
+            "TIT2": MagicMock(text=["Cover Song"]),
+            "APIC": apic_mock,
+        }
+        mutagen_file.get.return_value = apic_mock
 
         with patch("music_deduper.audio_metadata.MutagenFile", return_value=mutagen_file):
             track = read_audio_track(_make_path(), Path("D:/music"))

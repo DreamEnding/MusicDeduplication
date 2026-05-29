@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Music Deduplication</title>
-    <link rel="stylesheet" href="/static/style.css?v=2">
+    <link rel="stylesheet" href="/static/style.css?v=3">
   </head>
   <body>
     <div class="app-shell">
@@ -13,6 +13,18 @@
           <h1 class="sidebar-title">Music Deduplication</h1>
           <p class="sidebar-subtitle">本地扫描、本地分析、本地清理。</p>
         </div>
+
+        <section class="panel">
+          <h2 class="panel-title">显示模式</h2>
+          <label class="toggle">
+            <input type="radio" name="viewMode" value="dedup" checked>
+            <span>重复检测</span>
+          </label>
+          <label class="toggle">
+            <input type="radio" name="viewMode" value="files">
+            <span>文件管理</span>
+          </label>
+        </section>
 
         <section class="panel">
           <h2 class="panel-title">扫描目录</h2>
@@ -32,12 +44,12 @@
           </div>
         </section>
 
-        <section class="panel">
+        <section class="panel" id="rulesPanel">
           <h2 class="panel-title">保留规则</h2>
           <div id="ruleList" class="rule-list"></div>
         </section>
 
-        <section class="panel">
+        <section class="panel" id="executePanel">
           <h2 class="panel-title">执行设置</h2>
           <label class="toggle">
             <input id="previewToggle" type="checkbox">
@@ -47,7 +59,7 @@
           <input id="backupDirInput" class="input" type="text" placeholder="D:\MusicDeduplicationBackups">
         </section>
 
-        <section class="panel">
+        <section class="panel" id="algorithmPanel">
           <h2 class="panel-title">去重算法</h2>
           <label class="toggle">
             <input type="radio" name="algorithm" value="builtin" checked>
@@ -85,7 +97,8 @@
       </aside>
 
       <main class="content">
-        <header class="content-header">
+        <!-- Dedup mode header -->
+        <header class="content-header" id="dedupHeader">
           <div>
             <h2 class="content-title">重复结果</h2>
             <p id="scanSummary" class="content-subtitle">尚未开始扫描。</p>
@@ -93,7 +106,16 @@
           <button id="executeButton" class="button button-primary" type="button">执行去重</button>
         </header>
 
-        <section class="stats-grid">
+        <!-- File management mode header -->
+        <header class="content-header" id="filesHeader" style="display:none;">
+          <div>
+            <h2 class="content-title">全部文件</h2>
+            <p id="filesSummary" class="content-subtitle">尚未开始扫描。</p>
+          </div>
+        </header>
+
+        <!-- Dedup stats -->
+        <section class="stats-grid" id="dedupStats">
           <article class="stat-card">
             <span class="stat-label">总音频数</span>
             <strong id="totalAudioStat" class="stat-value">0</strong>
@@ -112,6 +134,26 @@
           </article>
         </section>
 
+        <!-- File management stats -->
+        <section class="stats-grid" id="filesStats" style="display:none;">
+          <article class="stat-card">
+            <span class="stat-label">总文件数</span>
+            <strong id="fmTotalStat" class="stat-value">0</strong>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">总大小</span>
+            <strong id="fmSizeStat" class="stat-value">0 B</strong>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">格式种类</span>
+            <strong id="fmFormatsStat" class="stat-value">0</strong>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">平均码率</span>
+            <strong id="fmBitrateStat" class="stat-value">0 kbps</strong>
+          </article>
+        </section>
+
         <section class="toolbar panel">
           <div class="toolbar-group">
             <input id="searchInput" class="input" type="search" placeholder="搜索歌名或歌手">
@@ -125,9 +167,45 @@
           </div>
         </section>
 
-        <section class="results panel">
+        <!-- Dedup results -->
+        <section class="results panel" id="dedupResults">
           <div id="resultsEmpty" class="empty-state">扫描完成后将在这里显示重复分组。</div>
           <div id="resultsList" class="group-list"></div>
+        </section>
+
+        <!-- File management results -->
+        <section class="results panel" id="filesResults" style="display:none;">
+          <div id="filesEmpty" class="empty-state">扫描完成后将在这里显示全部文件。</div>
+          <div class="track-table-wrap">
+            <table class="track-table">
+              <thead>
+                <tr>
+                  <th class="col-check"><input type="checkbox" id="selectAllCheckbox" title="全选"></th>
+                  <th class="col-cover">封面</th>
+                  <th data-sort="title" class="sortable">标题</th>
+                  <th data-sort="artist" class="sortable">歌手</th>
+                  <th data-sort="album" class="sortable">专辑</th>
+                  <th data-sort="duration" class="sortable">时长</th>
+                  <th data-sort="bitrate" class="sortable">码率</th>
+                  <th data-sort="format" class="sortable">格式</th>
+                  <th class="col-lyrics">歌词</th>
+                  <th data-sort="size" class="sortable">大小</th>
+                </tr>
+              </thead>
+              <tbody id="trackTableBody"></tbody>
+            </table>
+          </div>
+          <div class="pagination" id="trackPagination"></div>
+
+          <div id="batchEditBar" class="batch-edit-bar" style="display:none;">
+            <span class="batch-count">已选 <strong id="batchCount">0</strong> 首</span>
+            <input id="batchArtist" class="input" placeholder="歌手">
+            <input id="batchAlbum" class="input" placeholder="专辑">
+            <input id="batchGenre" class="input" placeholder="流派">
+            <input id="batchYear" class="input" type="number" placeholder="年份">
+            <button id="batchApplyBtn" class="button button-primary" type="button">批量应用</button>
+            <button id="batchClearBtn" class="button button-secondary" type="button">取消选择</button>
+          </div>
         </section>
 
         <section class="panel log-panel">
@@ -189,7 +267,79 @@
       </div>
     </template>
 
-    <script src="/static/app.js?v=2" defer></script>
+    <!-- Template: track edit form (expanded detail row) -->
+    <template id="trackDetailTemplate">
+      <tr class="track-detail-row">
+        <td colspan="8">
+          <div class="track-edit-form">
+            <div class="edit-cover-section">
+              <img class="edit-cover-img" src="" alt="封面">
+              <div class="edit-cover-actions">
+                <label class="button button-secondary edit-cover-upload-label">
+                  更换封面
+                  <input type="file" accept="image/*" class="edit-cover-file-input" hidden>
+                </label>
+              </div>
+            </div>
+            <div class="edit-fields-section">
+              <div class="edit-field-row">
+                <label>标题</label><input type="text" class="input edit-input" data-field="title">
+              </div>
+              <div class="edit-field-row">
+                <label>歌手</label><input type="text" class="input edit-input" data-field="artist">
+              </div>
+              <div class="edit-field-row">
+                <label>专辑</label><input type="text" class="input edit-input" data-field="album">
+              </div>
+              <div class="edit-field-row">
+                <label>年份</label><input type="number" class="input edit-input" data-field="year">
+              </div>
+              <div class="edit-field-row">
+                <label>流派</label><input type="text" class="input edit-input" data-field="genre">
+              </div>
+              <div class="edit-field-row">
+                <label>轨道号</label><input type="number" class="input edit-input" data-field="track_number">
+              </div>
+              <div class="edit-field-row edit-field-lyrics">
+                <label>歌词</label>
+                <div class="lyrics-edit-wrap">
+                  <span class="edit-lyrics-status"></span>
+                  <pre class="edit-lyrics-preview"></pre>
+                  <div class="lyrics-actions">
+                    <label class="button button-secondary edit-lyrics-upload-label">
+                      嵌入 LRC 文件
+                      <input type="file" accept=".lrc,.txt" class="edit-lyrics-file-input" hidden>
+                    </label>
+                    <button class="button button-secondary edit-remove-lyrics-btn" type="button" style="display:none;">移除歌词</button>
+                  </div>
+                </div>
+              </div>
+              <div class="edit-field-row">
+                <label>码率</label><span class="edit-readonly"></span>
+              </div>
+              <div class="edit-field-row">
+                <label>时长</label><span class="edit-readonly"></span>
+              </div>
+              <div class="edit-field-row">
+                <label>格式</label><span class="edit-readonly"></span>
+              </div>
+              <div class="edit-field-row">
+                <label>大小</label><span class="edit-readonly"></span>
+              </div>
+              <div class="edit-field-row">
+                <label>路径</label><span class="edit-readonly"></span>
+              </div>
+            </div>
+            <div class="edit-actions">
+              <button class="button button-primary edit-save-btn" type="button">保存</button>
+              <button class="button button-secondary edit-cancel-btn" type="button">取消</button>
+            </div>
+          </div>
+        </td>
+      </tr>
+    </template>
+
+    <script src="/static/app.js?v=3" defer></script>
     <script>
       window.addEventListener('error', function(e) {
         console.error('JS Error:', e.message, e.filename, e.lineno);

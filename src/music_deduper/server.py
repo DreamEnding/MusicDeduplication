@@ -12,8 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File as FastAPIFile, Form
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -22,6 +22,7 @@ from .ai_dedupe import ai_find_duplicate_groups
 from .config import get_settings
 from .dedupe import default_backup_dir, default_rule_states, find_duplicate_groups, human_size
 from .models import AudioTrack, DuplicateGroup
+from .audio_metadata import cover_key_for_path, get_cover
 from .scanner import list_available_roots, scan_audio_files
 
 # Load settings
@@ -126,6 +127,12 @@ class RulesUpdateRequest(BaseModel):
     rules: list[RuleState]
 
 
+class BatchUpdateRequest(BaseModel):
+    """Request model for batch track metadata update."""
+    paths: list[str]
+    updates: dict[str, str | int | None]
+
+
 def reset_state() -> None:
     """Reset module-level state. Intended for test isolation."""
     APP_STATE.tasks.clear()
@@ -218,6 +225,8 @@ def _track_to_dict(track: AudioTrack) -> dict:
         "bitrate_kbps": track.bitrate_kbps,
         "duration_seconds": track.duration_seconds,
         "has_cover": track.has_cover,
+        "has_lyrics": track.has_lyrics,
+        "cover_hash": cover_key_for_path(track.path) if track.has_cover else "",
         "metadata_source": track.metadata_source,
         "year": track.year,
         "genre": track.genre,
@@ -522,6 +531,499 @@ def create_app() -> FastAPI:
                 for r in request.rules
             ]
         return {"status": "ok", "rules": APP_STATE.rule_states}
+
+    # ---- GET /api/cover/{cover_hash} ----
+
+    @app.get("/api/cover/{cover_hash}")
+    def get_cover_image(cover_hash: str):
+        """Serve cached cover art image by hash key."""
+        cached = get_cover(cover_hash)
+        if cached is None:
+            raise HTTPException(status_code=404, detail="cover not found")
+        image_bytes, mime_type = cached
+        return Response(content=image_bytes, media_type=mime_type)
+
+    # ---- GET /api/tracks ----
+
+    @app.get("/api/tracks")
+    def get_tracks(
+        search: str = "",
+        artist: str = "",
+        sort: str = "path",
+        order: str = "asc",
+        page: int = 1,
+        page_size: int = 200,
+    ) -> dict:
+        """Return all scanned tracks with search/filter/sort/pagination."""
+        with APP_STATE.lock:
+            all_tracks = list(APP_STATE.tracks)
+
+        filtered = all_tracks
+        if search:
+            s = search.lower()
+            filtered = [
+                t for t in filtered
+                if s in (t.title or "").lower()
+                or s in (t.artist or "").lower()
+                or s in (t.album or "").lower()
+                or s in (t.relative_path or "").lower()
+            ]
+
+        if artist:
+            a = artist.lower()
+            filtered = [t for t in filtered if a in (t.artist or "").lower()]
+
+        reverse = order == "desc"
+        sort_key_map = {
+            "title": lambda t: (t.title or "").lower(),
+            "artist": lambda t: (t.artist or "").lower(),
+            "album": lambda t: (t.album or "").lower(),
+            "size": lambda t: t.size_bytes,
+            "bitrate": lambda t: t.bitrate_kbps or 0,
+            "duration": lambda t: t.duration_seconds or 0,
+            "format": lambda t: t.extension.lower(),
+        }
+        key_fn = sort_key_map.get(sort, lambda t: (t.relative_path or "").lower())
+        filtered.sort(key=key_fn, reverse=reverse)
+
+        total = len(filtered)
+        start = (page - 1) * page_size
+        page_tracks = filtered[start:start + page_size]
+
+        total_size = sum(t.size_bytes for t in all_tracks)
+        formats: dict[str, int] = {}
+        for t in all_tracks:
+            fmt = t.extension.upper().lstrip(".")
+            formats[fmt] = formats.get(fmt, 0) + 1
+        avg_bitrate = (
+            sum(t.bitrate_kbps or 0 for t in all_tracks) // len(all_tracks)
+            if all_tracks else 0
+        )
+
+        return {
+            "tracks": [_track_to_dict(t) for t in page_tracks],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "stats": {
+                "total_tracks": len(all_tracks),
+                "total_size": total_size,
+                "total_size_display": human_size(total_size),
+                "formats": formats,
+                "avg_bitrate": avg_bitrate,
+            },
+        }
+
+    # ---- PUT /api/tracks/update ----
+
+    class TrackUpdateRequest(BaseModel):
+        path: str
+        title: str | None = None
+        artist: str | None = None
+        album: str | None = None
+        year: int | None = None
+        genre: str | None = None
+        track_number: int | None = None
+
+    @app.put("/api/tracks/update")
+    def update_track_metadata(request: TrackUpdateRequest) -> dict:
+        """Update metadata tags on an audio file."""
+        target = Path(request.path)
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="file not found")
+
+        try:
+            from mutagen import File as MutagenFile
+            from mutagen.id3 import TIT2, TPE1, TALB, TDRC, TCON, TRCK
+
+            ext = target.suffix.lower()
+            mf = MutagenFile(target)
+            if mf is None:
+                raise HTTPException(status_code=400, detail="unsupported format")
+
+            if ext == ".mp3":
+                if mf.tags is None:
+                    mf.add_tags()
+                tags = mf.tags
+                if request.title is not None:
+                    tags.add(TIT2(encoding=3, text=[request.title]))
+                if request.artist is not None:
+                    tags.add(TPE1(encoding=3, text=[request.artist]))
+                if request.album is not None:
+                    tags.add(TALB(encoding=3, text=[request.album]))
+                if request.year is not None:
+                    tags.add(TDRC(encoding=3, text=[str(request.year)]))
+                if request.genre is not None:
+                    tags.add(TCON(encoding=3, text=[request.genre]))
+                if request.track_number is not None:
+                    tags.add(TRCK(encoding=3, text=[str(request.track_number)]))
+                mf.save()
+            elif ext in {".m4a", ".mp4", ".aac", ".alac"}:
+                if mf.tags is None:
+                    mf.add_tags()
+                tags = mf.tags
+                if request.title is not None:
+                    tags["\xa9nam"] = [request.title]
+                if request.artist is not None:
+                    tags["\xa9ART"] = [request.artist]
+                if request.album is not None:
+                    tags["\xa9alb"] = [request.album]
+                if request.year is not None:
+                    tags["\xa9day"] = [str(request.year)]
+                if request.genre is not None:
+                    tags["\xa9gen"] = [request.genre]
+                if request.track_number is not None:
+                    tags["trkn"] = [(request.track_number, 0)]
+                mf.save()
+            elif ext == ".wma":
+                if mf.tags is None:
+                    mf.add_tags()
+                tags = mf.tags
+                if request.title is not None:
+                    tags["Title"] = [request.title]
+                if request.artist is not None:
+                    tags["Author"] = [request.artist]
+                if request.album is not None:
+                    tags["WM/AlbumTitle"] = [request.album]
+                if request.year is not None:
+                    tags["WM/Year"] = [str(request.year)]
+                if request.genre is not None:
+                    tags["WM/Genre"] = [request.genre]
+                if request.track_number is not None:
+                    tags["WM/TrackNumber"] = [str(request.track_number)]
+                mf.save()
+            elif ext in {".flac", ".ogg"}:
+                if mf.tags is None:
+                    mf.add_tags()
+                tags = mf.tags
+                if request.title is not None:
+                    tags["title"] = [request.title]
+                if request.artist is not None:
+                    tags["artist"] = [request.artist]
+                if request.album is not None:
+                    tags["album"] = [request.album]
+                if request.year is not None:
+                    tags["date"] = [str(request.year)]
+                if request.genre is not None:
+                    tags["genre"] = [request.genre]
+                if request.track_number is not None:
+                    tags["tracknumber"] = [str(request.track_number)]
+                mf.save()
+            else:
+                raise HTTPException(status_code=400, detail=f"tag writing not supported for {ext}")
+
+            # Update in-memory state
+            with APP_STATE.lock:
+                from dataclasses import replace as dc_replace
+                for idx, t in enumerate(APP_STATE.tracks):
+                    if str(t.path) == request.path:
+                        updates = {}
+                        for field_name in ("title", "artist", "album", "year", "genre", "track_number"):
+                            val = getattr(request, field_name, None)
+                            if val is not None:
+                                updates[field_name] = val
+                        APP_STATE.tracks[idx] = dc_replace(t, **updates)
+                        break
+
+            logger.info(f"Updated metadata for {target}")
+            return {"status": "ok"}
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(f"Failed to update metadata for {target}: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    # ---- PUT /api/tracks/batch-update ----
+
+    @app.put("/api/tracks/batch-update")
+    def batch_update_tracks(batch_req: BatchUpdateRequest) -> dict:
+        """Update metadata tags on multiple audio files at once."""
+        if not batch_req.paths:
+            raise HTTPException(status_code=400, detail="no paths provided")
+
+        updated = 0
+        errors: list[str] = []
+        allowed_fields = {"title", "artist", "album", "year", "genre", "track_number"}
+
+        for path_str in batch_req.paths:
+            target = Path(path_str)
+            if not target.exists():
+                errors.append(f"{path_str}: file not found")
+                continue
+
+            try:
+                from mutagen import File as MutagenFile
+                from mutagen.id3 import TIT2, TPE1, TALB, TDRC, TCON, TRCK
+
+                ext = target.suffix.lower()
+                mf = MutagenFile(target)
+                if mf is None:
+                    errors.append(f"{path_str}: unsupported format")
+                    continue
+
+                # Build per-field updates
+                field_updates = {k: v for k, v in batch_req.updates.items() if k in allowed_fields}
+
+                if ext == ".mp3":
+                    if mf.tags is None:
+                        mf.add_tags()
+                    tag_map = {"title": TIT2, "artist": TPE1, "album": TALB, "year": TDRC, "genre": TCON, "track_number": TRCK}
+                    for field, cls in tag_map.items():
+                        if field in field_updates:
+                            val = field_updates[field]
+                            if val is not None:
+                                mf.tags.add(cls(encoding=3, text=[str(val)]))
+                    mf.save()
+                elif ext in {".m4a", ".mp4", ".aac", ".alac"}:
+                    if mf.tags is None:
+                        mf.add_tags()
+                    key_map = {"title": "©nam", "artist": "©ART", "album": "©alb", "year": "©day", "genre": "©gen"}
+                    for field, tag_key in key_map.items():
+                        if field in field_updates:
+                            val = field_updates[field]
+                            if val is not None:
+                                mf.tags[tag_key] = [str(val)]
+                    if "track_number" in field_updates and field_updates["track_number"] is not None:
+                        mf.tags["trkn"] = [(int(field_updates["track_number"]), 0)]
+                    mf.save()
+                elif ext == ".wma":
+                    if mf.tags is None:
+                        mf.add_tags()
+                    key_map = {"title": "Title", "artist": "Author", "album": "WM/AlbumTitle", "year": "WM/Year", "genre": "WM/Genre", "track_number": "WM/TrackNumber"}
+                    for field, tag_key in key_map.items():
+                        if field in field_updates:
+                            val = field_updates[field]
+                            if val is not None:
+                                mf.tags[tag_key] = [str(val)]
+                    mf.save()
+                elif ext in {".flac", ".ogg"}:
+                    if mf.tags is None:
+                        mf.add_tags()
+                    key_map = {"title": "title", "artist": "artist", "album": "album", "year": "date", "genre": "genre", "track_number": "tracknumber"}
+                    for field, tag_key in key_map.items():
+                        if field in field_updates:
+                            val = field_updates[field]
+                            if val is not None:
+                                mf.tags[tag_key] = [str(val)]
+                    mf.save()
+                else:
+                    errors.append(f"{path_str}: unsupported format {ext}")
+                    continue
+
+                # Update in-memory state
+                with APP_STATE.lock:
+                    from dataclasses import replace as dc_replace
+                    for idx, t in enumerate(APP_STATE.tracks):
+                        if str(t.path) == path_str:
+                            mem_updates = {k: (int(v) if k in ("year", "track_number") and v else v) for k, v in field_updates.items() if v is not None}
+                            APP_STATE.tracks[idx] = dc_replace(t, **mem_updates)
+                            break
+
+                updated += 1
+            except Exception as exc:
+                errors.append(f"{path_str}: {exc}")
+
+        logger.info(f"Batch update: {updated}/{len(batch_req.paths)} files updated")
+        return {"updated": updated, "total": len(batch_req.paths), "errors": errors}
+
+    # ---- GET /api/tracks/lyrics ----
+
+    @app.get("/api/tracks/lyrics")
+    def get_track_lyrics(path: str) -> dict:
+        """Extract and return embedded lyrics text from an audio file."""
+        target = Path(path)
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="file not found")
+
+        try:
+            from mutagen import File as MutagenFile
+            from .audio_metadata import (
+                _extract_id3_lyrics_text, _extract_mp4_lyrics_text,
+                _extract_wma_lyrics_text, _extract_vorbis_lyrics_text,
+            )
+
+            ext = target.suffix.lower()
+            mf = MutagenFile(target)
+            if mf is None:
+                return {"lyrics": "", "has_lyrics": False}
+
+            tags = mf.tags or {}
+            lyrics = ""
+
+            if ext in {".mp3", ".dsf"}:
+                lyrics = _extract_id3_lyrics_text(tags)
+            elif ext in {".m4a", ".mp4", ".aac", ".alac"}:
+                lyrics = _extract_mp4_lyrics_text(tags)
+            elif ext == ".wma":
+                lyrics = _extract_wma_lyrics_text(tags)
+            elif ext in {".flac", ".ogg"}:
+                lyrics = _extract_vorbis_lyrics_text(tags)
+
+            return {"lyrics": lyrics, "has_lyrics": bool(lyrics.strip())}
+
+        except Exception as exc:
+            logger.error(f"Failed to read lyrics for {target}: {exc}")
+            return {"lyrics": "", "has_lyrics": False}
+
+    # ---- PUT /api/tracks/lyrics ----
+
+    class LyricsUpdateRequest(BaseModel):
+        path: str
+        lyrics: str
+
+    @app.put("/api/tracks/lyrics")
+    def update_track_lyrics(req: LyricsUpdateRequest) -> dict:
+        """Write lyrics text into an audio file's tags."""
+        target = Path(req.path)
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="file not found")
+
+        try:
+            from mutagen import File as MutagenFile
+            from mutagen.id3 import USLT
+
+            ext = target.suffix.lower()
+            mf = MutagenFile(target)
+            if mf is None:
+                raise HTTPException(status_code=400, detail="unsupported format")
+
+            lyrics_text = req.lyrics.strip()
+
+            if ext in {".mp3", ".dsf"}:
+                if mf.tags is None:
+                    mf.add_tags()
+                if lyrics_text:
+                    mf.tags.add(USLT(encoding=3, lang="eng", desc="", text=[lyrics_text]))
+                else:
+                    # Remove lyrics if empty
+                    try:
+                        mf.tags.delall("USLT")
+                    except Exception:
+                        pass
+                mf.save()
+            elif ext in {".m4a", ".mp4", ".aac", ".alac"}:
+                if mf.tags is None:
+                    mf.add_tags()
+                if lyrics_text:
+                    mf.tags["©lyr"] = [lyrics_text]
+                else:
+                    mf.tags.pop("©lyr", None)
+                mf.save()
+            elif ext == ".wma":
+                if mf.tags is None:
+                    mf.add_tags()
+                if lyrics_text:
+                    mf.tags["WM/Lyrics"] = [lyrics_text]
+                else:
+                    mf.tags.pop("WM/Lyrics", None)
+                mf.save()
+            elif ext in {".flac", ".ogg"}:
+                if mf.tags is None:
+                    mf.add_tags()
+                if lyrics_text:
+                    mf.tags["LYRICS"] = [lyrics_text]
+                else:
+                    mf.tags.pop("LYRICS", None)
+                    mf.tags.pop("UNSYNCEDLYRICS", None)
+                mf.save()
+            else:
+                raise HTTPException(status_code=400, detail=f"lyrics writing not supported for {ext}")
+
+            # Update in-memory state
+            with APP_STATE.lock:
+                from dataclasses import replace as dc_replace
+                for idx, t in enumerate(APP_STATE.tracks):
+                    if str(t.path) == req.path:
+                        APP_STATE.tracks[idx] = dc_replace(t, has_lyrics=bool(lyrics_text))
+                        break
+
+            logger.info(f"Updated lyrics for {target}")
+            return {"status": "ok"}
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(f"Failed to write lyrics for {target}: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    # ---- POST /api/tracks/cover ----
+
+    @app.post("/api/tracks/cover")
+    async def update_track_cover(
+        path: str = Form(...),
+        cover: UploadFile = FastAPIFile(...),
+    ) -> dict:
+        """Upload and embed a new cover image into an audio file."""
+        target = Path(path)
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="file not found")
+
+        try:
+            image_bytes = await cover.read()
+            mime_type = cover.content_type or "image/jpeg"
+
+            from mutagen import File as MutagenFile
+            from mutagen.id3 import APIC
+
+            ext = target.suffix.lower()
+            mf = MutagenFile(target)
+            if mf is None:
+                raise HTTPException(status_code=400, detail="unsupported format")
+
+            if ext in {".mp3", ".dsf"}:
+                if mf.tags is None:
+                    mf.add_tags()
+                mf.tags.add(APIC(encoding=3, mime=mime_type, type=3, desc="Cover", data=image_bytes))
+                mf.save()
+            elif ext in {".m4a", ".mp4", ".aac", ".alac"}:
+                if mf.tags is None:
+                    mf.add_tags()
+                from mutagen.mp4 import MP4Cover
+                fmt = 0x0E if "png" in mime_type else 0x0D
+                mf.tags["covr"] = [MP4Cover(image_bytes, imageformat=fmt)]
+                mf.save()
+            elif ext in {".flac", ".ogg"}:
+                import struct as _struct
+                mime_bytes = mime_type.encode("ascii")
+                desc_bytes = b"Cover"
+                pic_data = _struct.pack(">I", 3)
+                pic_data += _struct.pack(">I", len(mime_bytes)) + mime_bytes
+                pic_data += _struct.pack(">I", len(desc_bytes)) + desc_bytes
+                pic_data += _struct.pack(">II", 0, 0)
+                pic_data += _struct.pack(">II", 0, 0)
+                pic_data += _struct.pack(">I", len(image_bytes)) + image_bytes
+                encoded = base64.b64encode(pic_data).decode("ascii")
+                if mf.tags is None:
+                    mf.add_tags()
+                mf.tags["metadata_block_picture"] = [encoded]
+                mf.save()
+            elif ext == ".wma":
+                from mutagen.asf import ASFByteArrayAttribute
+                if mf.tags is None:
+                    mf.add_tags()
+                mf.tags["WM/Picture"] = [ASFByteArrayAttribute(image_bytes)]
+                mf.save()
+            else:
+                raise HTTPException(status_code=400, detail=f"cover writing not supported for {ext}")
+
+            from .audio_metadata import cache_cover
+            cache_cover(target, image_bytes, mime_type)
+            with APP_STATE.lock:
+                from dataclasses import replace as dc_replace
+                for idx, t in enumerate(APP_STATE.tracks):
+                    if str(t.path) == path:
+                        APP_STATE.tracks[idx] = dc_replace(t, has_cover=True)
+                        break
+
+            logger.info(f"Updated cover for {target}")
+            return {"status": "ok"}
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(f"Failed to update cover for {target}: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc))
 
     # ---- GET /api/groups ----
 

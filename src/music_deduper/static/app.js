@@ -26,6 +26,7 @@ function loadSavedState() {
         backupDir: parsed.backupDir || "",
         algorithm: parsed.algorithm || "builtin",
         rules: parsed.rules || defaultRules,
+        viewMode: parsed.viewMode || "dedup",
       };
     }
   } catch (e) {
@@ -42,6 +43,7 @@ function saveState() {
       backupDir: state.backupDir,
       algorithm: state.algorithm,
       rules: state.rules,
+      viewMode: state.viewMode,
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
   } catch (e) {
@@ -54,6 +56,13 @@ const savedState = loadSavedState();
 const state = {
   taskId: "",
   groups: [],
+  tracks: [],
+  trackTotal: 0,
+  trackPage: 1,
+  trackPageSize: 200,
+  trackSort: "path",
+  trackOrder: "asc",
+  trackStats: {},
   stats: {
     total_tracks: 0,
     total_groups: 0,
@@ -70,6 +79,8 @@ const state = {
   executeTaskId: null,
   algorithm: savedState?.algorithm || "builtin",
   rules: savedState?.rules || defaultRules,
+  viewMode: savedState?.viewMode || "dedup",
+  selectedTracks: new Set(),
 };
 
 // ---- Cached DOM references ----
@@ -121,6 +132,33 @@ const elements = {
   aiModelInput: $("#aiModelInput"),
   groupTemplate: $("#groupTemplate"),
   trackComparisonTemplate: $("#trackComparisonTemplate"),
+  trackDetailTemplate: $("#trackDetailTemplate"),
+  rulesPanel: $("#rulesPanel"),
+  executePanel: $("#executePanel"),
+  algorithmPanel: $("#algorithmPanel"),
+  dedupHeader: $("#dedupHeader"),
+  filesHeader: $("#filesHeader"),
+  dedupStats: $("#dedupStats"),
+  filesStats: $("#filesStats"),
+  dedupResults: $("#dedupResults"),
+  filesResults: $("#filesResults"),
+  filesEmpty: $("#filesEmpty"),
+  trackTableBody: $("#trackTableBody"),
+  trackPagination: $("#trackPagination"),
+  fmTotalStat: $("#fmTotalStat"),
+  fmSizeStat: $("#fmSizeStat"),
+  fmFormatsStat: $("#fmFormatsStat"),
+  fmBitrateStat: $("#fmBitrateStat"),
+  filesSummary: $("#filesSummary"),
+  selectAllCheckbox: $("#selectAllCheckbox"),
+  batchEditBar: $("#batchEditBar"),
+  batchCount: $("#batchCount"),
+  batchArtist: $("#batchArtist"),
+  batchAlbum: $("#batchAlbum"),
+  batchGenre: $("#batchGenre"),
+  batchYear: $("#batchYear"),
+  batchApplyBtn: $("#batchApplyBtn"),
+  batchClearBtn: $("#batchClearBtn"),
 };
 
 // ---- Animation helpers ----
@@ -193,9 +231,7 @@ function init() {
   bindEvents();
   renderRules();
   loadRoots();
-  loadGroups();
 
-  // Restore saved state to UI
   if (savedState) {
     elements.previewToggle.checked = state.previewOnly;
     elements.backupDirInput.value = state.backupDir;
@@ -203,6 +239,15 @@ function init() {
       elements.aiConfigPanel.style.display = "block";
       document.querySelector('input[name="algorithm"][value="ai"]').checked = true;
     }
+  }
+
+  document.querySelector(`input[name="viewMode"][value="${state.viewMode}"]`).checked = true;
+  applyViewMode();
+
+  if (state.viewMode === "files") {
+    loadTracks();
+  } else {
+    loadGroups();
   }
 }
 
@@ -241,6 +286,38 @@ function bindEvents() {
       saveState();
     });
   });
+
+  // View mode radio buttons
+  document.querySelectorAll('input[name="viewMode"]').forEach((radio) => {
+    radio.addEventListener("change", () => {
+      state.viewMode = radio.value;
+      saveState();
+      applyViewMode();
+      if (state.viewMode === "files") {
+        loadTracks();
+      } else {
+        loadGroups();
+      }
+    });
+  });
+
+  // Track table header sort
+  document.querySelectorAll(".track-table th.sortable").forEach((th) => {
+    th.addEventListener("click", onTrackSort);
+  });
+
+  // Select all checkbox
+  if (elements.selectAllCheckbox) {
+    elements.selectAllCheckbox.addEventListener("change", onSelectAll);
+  }
+
+  // Batch edit buttons
+  if (elements.batchApplyBtn) {
+    elements.batchApplyBtn.addEventListener("click", onBatchApply);
+  }
+  if (elements.batchClearBtn) {
+    elements.batchClearBtn.addEventListener("click", onBatchClear);
+  }
 
   // Close modal on backdrop click
   const backdrop = $(".modal-backdrop");
@@ -495,9 +572,14 @@ function startPolling() {
         const summary =
           payload.status === "stopped"
             ? "扫描已停止。"
-            : `扫描结束，共识别 ${state.stats.total_tracks} 首音频，发现 ${state.stats.total_groups} 组重复。`;
+            : `扫描结束，共处理 ${payload.processed_files || 0} 首音频。`;
         elements.scanSummary.textContent = summary;
-        await loadGroups();
+        if (elements.filesSummary) elements.filesSummary.textContent = summary;
+        if (state.viewMode === "files") {
+          await loadTracks();
+        } else {
+          await loadGroups();
+        }
       }
 
       if (payload.status === "error") {
@@ -915,6 +997,354 @@ function renderLog(logLines) {
   if (!logLines || logLines.length === 0) return;
   elements.scanLog.textContent = logLines.join("\n");
   elements.scanLog.scrollTop = elements.scanLog.scrollHeight;
+}
+
+// ---- View mode switching ----
+
+function applyViewMode() {
+  const isFiles = state.viewMode === "files";
+  elements.dedupHeader.style.display = isFiles ? "none" : "";
+  elements.filesHeader.style.display = isFiles ? "" : "none";
+  elements.dedupStats.style.display = isFiles ? "none" : "";
+  elements.filesStats.style.display = isFiles ? "" : "none";
+  elements.dedupResults.style.display = isFiles ? "none" : "";
+  elements.filesResults.style.display = isFiles ? "" : "none";
+  elements.resortButton.style.display = isFiles ? "none" : "";
+  elements.executeButton.style.display = isFiles ? "none" : "";
+  elements.rulesPanel.style.display = isFiles ? "none" : "";
+  elements.executePanel.style.display = isFiles ? "none" : "";
+  elements.algorithmPanel.style.display = isFiles ? "none" : "";
+}
+
+// ---- Load & render tracks (file management mode) ----
+
+async function loadTracks() {
+  try {
+    const search = elements.searchInput.value.trim();
+    const artist = elements.artistFilter.value.trim();
+    const params = new URLSearchParams();
+    if (search) params.set("search", search);
+    if (artist) params.set("artist", artist);
+    params.set("sort", state.trackSort);
+    params.set("order", state.trackOrder);
+    params.set("page", String(state.trackPage));
+    params.set("page_size", String(state.trackPageSize));
+    const payload = await api(`/api/tracks?${params.toString()}`);
+    state.tracks = payload.tracks || [];
+    state.trackTotal = payload.total || 0;
+    state.trackPage = payload.page || 1;
+    state.trackStats = payload.stats || {};
+    renderTrackStats();
+    renderTracks();
+    renderTrackPagination();
+  } catch (err) {
+    console.error("loadTracks error:", err);
+  }
+}
+
+function renderTrackStats() {
+  const s = state.trackStats;
+  animateValue(elements.fmTotalStat, 0, s.total_tracks || 0, 400);
+  elements.fmSizeStat.textContent = s.total_size_display || "0 B";
+  elements.fmFormatsStat.textContent = Object.keys(s.formats || {}).length;
+  elements.fmBitrateStat.textContent = s.avg_bitrate ? `${s.avg_bitrate} kbps` : "-";
+  if (s.total_tracks > 0) {
+    elements.filesSummary.textContent = `共 ${s.total_tracks} 首音频，${s.total_size_display || "0 B"}`;
+  }
+}
+
+function renderTracks() {
+  elements.trackTableBody.innerHTML = "";
+  elements.filesEmpty.hidden = state.tracks.length > 0;
+  state.tracks.forEach((track, index) => {
+    const tr = document.createElement("tr");
+    tr.className = "track-row";
+
+    // Checkbox cell
+    const checkTd = document.createElement("td");
+    checkTd.className = "col-check-cell";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = state.selectedTracks.has(track.path);
+    checkbox.addEventListener("change", (e) => {
+      e.stopPropagation();
+      if (e.target.checked) state.selectedTracks.add(track.path);
+      else state.selectedTracks.delete(track.path);
+      updateBatchBar();
+    });
+    checkTd.appendChild(checkbox);
+    tr.appendChild(checkTd);
+
+    // Cover cell
+    const coverTd = document.createElement("td");
+    coverTd.className = "col-cover-cell";
+    if (track.has_cover && track.cover_hash) {
+      const img = document.createElement("img");
+      img.className = "cover-thumb";
+      img.src = `/api/cover/${track.cover_hash}`;
+      img.alt = "";
+      img.loading = "lazy";
+      coverTd.appendChild(img);
+    } else {
+      coverTd.innerHTML = '<div class="cover-placeholder">♪</div>';
+    }
+    tr.appendChild(coverTd);
+    // Data cells
+    const cells = [
+      escapeHtml(track.title || "(无标题)"),
+      escapeHtml(track.artist || "-"),
+      escapeHtml(track.album || "-"),
+      track.duration_seconds ? formatDuration(track.duration_seconds) : "-",
+      track.bitrate_kbps ? `${track.bitrate_kbps} kbps` : "-",
+      escapeHtml(track.format_info || track.extension || "-"),
+      track.has_lyrics ? "✓" : "✗",
+      track.size_display || "-",
+    ];
+    cells.forEach((text) => {
+      const td = document.createElement("td");
+      td.textContent = text;
+      tr.appendChild(td);
+    });
+    tr.addEventListener("click", () => toggleTrackDetail(tr, track));
+    elements.trackTableBody.appendChild(tr);
+  });
+}
+
+function toggleTrackDetail(row, track) {
+  const isExpanded = row.classList.contains("expanded");
+  elements.trackTableBody.querySelectorAll(".track-row.expanded").forEach((r) => {
+    r.classList.remove("expanded");
+    const detail = r.nextElementSibling;
+    if (detail && detail.classList.contains("track-detail-row")) detail.remove();
+  });
+  if (isExpanded) return;
+  row.classList.add("expanded");
+  const fragment = elements.trackDetailTemplate.content.cloneNode(true);
+  const detailRow = fragment.querySelector("tr");
+
+  // Prevent clicks inside the detail row from bubbling to the parent track row
+  detailRow.addEventListener("click", (e) => e.stopPropagation());
+
+  // Cover
+  const coverImg = detailRow.querySelector(".edit-cover-img");
+  if (track.has_cover && track.cover_hash) {
+    coverImg.src = `/api/cover/${track.cover_hash}`;
+  } else {
+    coverImg.style.display = "none";
+  }
+
+  // Cover upload
+  detailRow.querySelector(".edit-cover-file-input").addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const formData = new FormData();
+      formData.append("path", track.path);
+      formData.append("cover", file);
+      await fetch("/api/tracks/cover", { method: "POST", body: formData });
+      appendLog(`封面已更新: ${track.relative_path}`);
+      await loadTracks();
+    } catch (err) { appendLog("封面更新失败: " + err.message); }
+  });
+
+  // Editable fields
+  const fieldMap = { title: track.title, artist: track.artist, album: track.album, year: track.year || "", genre: track.genre, track_number: track.track_number || "" };
+  detailRow.querySelectorAll(".edit-input").forEach((input) => {
+    input.value = fieldMap[input.dataset.field] ?? "";
+  });
+
+  // Lyrics section — show status, allow LRC file upload
+  const lyricsStatus = detailRow.querySelector(".edit-lyrics-status");
+  const lyricsPreview = detailRow.querySelector(".edit-lyrics-preview");
+  const lyricsRemoveBtn = detailRow.querySelector(".edit-remove-lyrics-btn");
+  lyricsStatus.textContent = track.has_lyrics ? "✓ 有内置歌词" : "✗ 无歌词";
+  // Load existing lyrics text for preview
+  api(`/api/tracks/lyrics?path=${encodeURIComponent(track.path)}`).then((data) => {
+    if (data.lyrics) {
+      lyricsPreview.textContent = data.lyrics.substring(0, 500) + (data.lyrics.length > 500 ? "..." : "");
+      lyricsPreview.style.display = "";
+      lyricsRemoveBtn.style.display = "";
+      lyricsStatus.textContent = "✓ 有内置歌词";
+    } else {
+      lyricsPreview.style.display = "none";
+      lyricsRemoveBtn.style.display = "none";
+      lyricsStatus.textContent = "✗ 无歌词";
+    }
+  }).catch(() => { lyricsPreview.style.display = "none"; lyricsRemoveBtn.style.display = "none"; });
+
+  // Upload LRC file
+  detailRow.querySelector(".edit-lyrics-file-input").addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const lyricsText = await file.text();
+      await api("/api/tracks/lyrics", { method: "PUT", body: JSON.stringify({ path: track.path, lyrics: lyricsText }) });
+      appendLog(`歌词已嵌入: ${track.relative_path}`);
+      lyricsPreview.textContent = lyricsText.substring(0, 500) + (lyricsText.length > 500 ? "..." : "");
+      lyricsPreview.style.display = "";
+      lyricsRemoveBtn.style.display = "";
+      lyricsStatus.textContent = "✓ 有内置歌词";
+      await loadTracks();
+    } catch (err) { appendLog("歌词嵌入失败: " + (err instanceof Error ? err.message : String(err))); }
+  });
+
+  // Remove lyrics
+  lyricsRemoveBtn.addEventListener("click", async () => {
+    try {
+      await api("/api/tracks/lyrics", { method: "PUT", body: JSON.stringify({ path: track.path, lyrics: "" }) });
+      appendLog(`歌词已移除: ${track.relative_path}`);
+      lyricsPreview.style.display = "none";
+      lyricsRemoveBtn.style.display = "none";
+      lyricsStatus.textContent = "✗ 无歌词";
+      await loadTracks();
+    } catch (err) { appendLog("歌词移除失败: " + (err instanceof Error ? err.message : String(err))); }
+  });
+
+  // Read-only fields
+  const readonlyFields = detailRow.querySelectorAll(".edit-readonly");
+  const vals = [
+    track.bitrate_kbps ? `${track.bitrate_kbps} kbps` : "-",
+    track.duration_seconds ? formatDuration(track.duration_seconds) : "-",
+    track.format_info || track.metadata_source || "-",
+    track.size_display || "-",
+    track.relative_path || track.path || "-",
+  ];
+  readonlyFields.forEach((span, i) => { span.textContent = vals[i] || "-"; });
+
+  // Save
+  detailRow.querySelector(".edit-save-btn").addEventListener("click", async () => {
+    const updates = { path: track.path };
+    detailRow.querySelectorAll(".edit-input").forEach((input) => {
+      let val = input.value.trim();
+      if (input.dataset.field === "year" || input.dataset.field === "track_number") val = val ? parseInt(val, 10) : null;
+      updates[input.dataset.field] = val;
+    });
+    try {
+      await api("/api/tracks/update", { method: "PUT", body: JSON.stringify(updates) });
+      appendLog(`已保存: ${track.relative_path}`);
+      row.classList.remove("expanded");
+      detailRow.remove();
+      await loadTracks();
+    } catch (err) { appendLog("保存失败: " + err.message); }
+  });
+
+  // Cancel
+  detailRow.querySelector(".edit-cancel-btn").addEventListener("click", () => {
+    row.classList.remove("expanded");
+    detailRow.remove();
+  });
+
+  row.after(fragment);
+}
+
+function renderTrackPagination() {
+  const container = elements.trackPagination;
+  container.innerHTML = "";
+  const totalPages = Math.ceil(state.trackTotal / state.trackPageSize);
+  if (totalPages <= 1) return;
+  const prevBtn = document.createElement("button");
+  prevBtn.textContent = "上一页";
+  prevBtn.disabled = state.trackPage <= 1;
+  prevBtn.addEventListener("click", () => { state.trackPage = Math.max(1, state.trackPage - 1); loadTracks(); });
+  container.appendChild(prevBtn);
+  const info = document.createElement("span");
+  info.className = "page-info";
+  info.textContent = `${state.trackPage} / ${totalPages} 页 (共 ${state.trackTotal} 首)`;
+  container.appendChild(info);
+  const nextBtn = document.createElement("button");
+  nextBtn.textContent = "下一页";
+  nextBtn.disabled = state.trackPage >= totalPages;
+  nextBtn.addEventListener("click", () => { state.trackPage = Math.min(totalPages, state.trackPage + 1); loadTracks(); });
+  container.appendChild(nextBtn);
+}
+
+function onTrackSort(event) {
+  const th = event.currentTarget;
+  const sortKey = th.dataset.sort;
+  if (state.trackSort === sortKey) {
+    state.trackOrder = state.trackOrder === "asc" ? "desc" : "asc";
+  } else {
+    state.trackSort = sortKey;
+    state.trackOrder = "asc";
+  }
+  document.querySelectorAll(".track-table th.sortable").forEach((h) => { h.classList.remove("sort-asc", "sort-desc"); });
+  th.classList.add(state.trackOrder === "asc" ? "sort-asc" : "sort-desc");
+  state.trackPage = 1;
+  loadTracks();
+}
+
+// ---- Batch selection & editing ----
+
+function onSelectAll() {
+  const checked = elements.selectAllCheckbox.checked;
+  if (checked) {
+    state.tracks.forEach((t) => state.selectedTracks.add(t.path));
+  } else {
+    state.selectedTracks.clear();
+  }
+  // Update individual checkboxes directly
+  elements.trackTableBody.querySelectorAll(".col-check-cell input[type=checkbox]").forEach((cb) => {
+    cb.checked = checked;
+  });
+  updateBatchBar();
+}
+
+function updateBatchBar() {
+  const count = state.selectedTracks.size;
+  elements.batchCount.textContent = count;
+  elements.batchEditBar.style.display = count > 0 ? "flex" : "none";
+  // Update select-all checkbox state
+  if (elements.selectAllCheckbox) {
+    const allChecked = state.tracks.length > 0 && count === state.tracks.length;
+    elements.selectAllCheckbox.checked = allChecked;
+    elements.selectAllCheckbox.indeterminate = count > 0 && !allChecked;
+  }
+}
+
+async function onBatchApply() {
+  if (state.selectedTracks.size === 0) return;
+  const updates = {};
+  const artist = elements.batchArtist.value.trim();
+  const album = elements.batchAlbum.value.trim();
+  const genre = elements.batchGenre.value.trim();
+  const year = elements.batchYear.value.trim();
+  if (artist) updates.artist = artist;
+  if (album) updates.album = album;
+  if (genre) updates.genre = genre;
+  if (year) updates.year = parseInt(year, 10) || null;
+  if (Object.keys(updates).length === 0) {
+    appendLog("请至少填写一个要修改的字段");
+    return;
+  }
+  try {
+    const result = await api("/api/tracks/batch-update", {
+      method: "PUT",
+      body: JSON.stringify({ paths: Array.from(state.selectedTracks), updates }),
+    });
+    appendLog(`批量更新完成: ${result.updated}/${result.total} 首已更新`);
+    if (result.errors && result.errors.length > 0) {
+      result.errors.forEach((e) => appendLog("错误: " + e));
+    }
+    // Clear selection and refresh
+    state.selectedTracks.clear();
+    elements.batchArtist.value = "";
+    elements.batchAlbum.value = "";
+    elements.batchGenre.value = "";
+    elements.batchYear.value = "";
+    updateBatchBar();
+    await loadTracks();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    appendLog("批量更新失败: " + msg);
+  }
+}
+
+function onBatchClear() {
+  state.selectedTracks.clear();
+  elements.trackTableBody.querySelectorAll(".col-check-cell input[type=checkbox]").forEach((cb) => {
+    cb.checked = false;
+  });
+  updateBatchBar();
 }
 
 // ---- Bootstrap ----
